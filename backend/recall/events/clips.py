@@ -14,7 +14,10 @@ from typing import Optional
 import cv2
 import numpy as np
 
-CLIP_EVENTS = {"went_into", "went_worn", "went_in_hand", "placed", "picked_up"}
+CLIP_EVENTS = {
+    "went_into", "went_worn", "went_in_hand", "placed", "picked_up",
+    "dose_appears_taken", "dose_unclear", "repeat_reach",
+}
 _OUT_W, _OUT_H = 640, 360
 _PRE_S  = 6.0
 _POST_S = 2.0

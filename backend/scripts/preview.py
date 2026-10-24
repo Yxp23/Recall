@@ -1,7 +1,7 @@
 """
-Step 3b preview: camera + YOLO-World + hands/face overlay + auto zones + item memory.
+Step 4 preview: camera + YOLO-World + hands/face overlay + auto zones + item memory + dose logic.
 Run from repo root: python backend/scripts/preview.py
-Keys: g=where is glasses  w=where is wallet  m=where is medication  q=quit
+Keys: g=glasses  w=wallet  m=medication  c=play clip  r=reset doses  q=quit
 """
 import json
 import os
@@ -19,11 +19,13 @@ from recall.events.tracker import ItemTracker, Observation, State
 from recall.events.store   import EventStore
 from recall.events.answers import where_is, state_label
 from recall.events.clips   import RollingBuffer, ClipSaver, CLIP_EVENTS
+from recall.events.dose    import DoseMonitor, DoseEvent, BANNER_TEXT, BANNER_SECOND_TEXT
 
 CAMERA_INDEX    = 0
 MODEL_PATH      = "models/yolov8l-worldv2.pt"
 HAND_MODEL_PATH = "models/hand_landmarker.task"
 FACE_MODEL_PATH = "models/face_landmarker.task"
+POSE_MODEL_PATH = "models/pose_landmarker_full.task"
 IMGSZ           = 640
 
 def _load_item_descriptions(path: str = "data/items.json") -> tuple[list[str], dict[str, str]]:
@@ -337,11 +339,14 @@ def _build_observation(item: str, last_detections: list, held: set[str],
                        confidence=best_conf, ts=now)
 
 
-def _draw_status_panel(frame: np.ndarray, trackers: dict[str, ItemTracker]) -> None:
-    """Top-right panel showing each item's current state."""
+def _draw_status_panel(frame: np.ndarray, trackers: dict[str, ItemTracker],
+                        monitor=None) -> None:
+    """Top-right panel showing each item's current state + dose count."""
     lines = [f"{item:<12}{state_label(t)}" for item, t in trackers.items()]
+    if monitor is not None:
+        lines.append(monitor.panel_line())
     pad, lh = 8, 22
-    w_panel = 260
+    w_panel = 300
     h_panel = pad * 2 + lh * len(lines)
     x0 = frame.shape[1] - w_panel - 10
     y0 = 10
@@ -381,6 +386,72 @@ def _draw_answer(frame: np.ndarray, text: str) -> None:
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (x0, y0 + lh * (i + 1)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 200), 2)
+
+
+def _draw_dose_debug(frame: np.ndarray, dbg: dict) -> None:
+    """Bottom-left overlay: dose state, face visible, palm/mouth ratio, last event."""
+    state_str = dbg["state"].upper()
+    if dbg["seconds_left"] > 0:
+        state_str += f"  {dbg['seconds_left']:.1f}s left"
+
+    ratio = dbg["closest_ratio"]
+    ratio_str = (f"{ratio:.2f} (thresh {dbg['threshold']:.2f})"
+                 if ratio is not None else "N/A")
+
+    since = dbg["since_ref"]
+    since_str = f"{since:.1f}s" if since is not None else "N/A"
+
+    lines = [
+        "[DOSE DEBUG]",
+        f"State:      {state_str}",
+        f"Mouth vis:  {'yes' if dbg['mouth_visible'] else 'no'}",
+        f"Hand/mouth: {ratio_str}",
+        f"Since last pickup/placed: {since_str}",
+        f"Last:       {dbg['last_event'] or '-'}",
+    ]
+
+    lh = 20
+    h  = lh * len(lines) + 12
+    w  = 380
+    x0 = 10
+    y0 = frame.shape[0] - h - 10
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0 - 4, y0 - 4), (x0 + w, y0 + h), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+    for i, line in enumerate(lines):
+        color = (110, 200, 255) if i == 0 else (200, 200, 200)
+        cv2.putText(frame, line, (x0, y0 + lh * (i + 1) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+
+def _draw_banner(frame: np.ndarray, text: str) -> None:
+    """Large center overlay for double-dose alert (orange text on dark bg)."""
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > 42:
+            lines.append(cur.rstrip())
+            cur = w + " "
+        else:
+            cur += w + " "
+    if cur.strip():
+        lines.append(cur.rstrip())
+
+    lh      = 38
+    h_total = lh * len(lines) + 24
+    w_total = frame.shape[1] - 80
+    x0      = 40
+    y0      = frame.shape[0] // 2 - h_total // 2
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0 - 12, y0 - 12),
+                  (x0 + w_total, y0 + h_total + 12), (10, 10, 60), -1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (x0, y0 + lh * (i + 1)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (60, 130, 255), 2)
 
 
 def _load_clip(path: str) -> tuple[list[np.ndarray], float]:
@@ -424,9 +495,11 @@ def main():
     auto_zones      = AutoZones()
     trackers        = {item: ItemTracker(item) for item in LOGICAL_ITEMS}
     store           = EventStore()
+    monitor         = DoseMonitor(store)
     buffer          = RollingBuffer(duration_s=10.0)
     clip_saver      = ClipSaver(out_dir="data/clips")
     answer_msg:      Optional[tuple[str, float]] = None   # (text, expire_perf_ts)
+    banner_msg:      Optional[tuple[str, float]] = None   # (text, expire_perf_ts) 8 s
     last_asked_item: Optional[str]               = None   # for c key
     clip_frames:     list[np.ndarray]            = []     # loaded clip for playback
     clip_frame_idx:  int                         = 0
@@ -436,12 +509,14 @@ def main():
     fps_smooth      = 0.0
     t_prev          = time.perf_counter()
     frame_idx       = 0
+    last_reset_t    = 0.0
     last_detections: list[tuple] = []
 
     print(f"Camera {CAMERA_INDEX} opened. Device: {device}.")
-    print("g=glasses  w=wallet  m=medication  c=play clip  q=quit")
+    print(f"Doses loaded from DB: {len(monitor._doses)}")
+    print("g=glasses  w=wallet  m=medication  c=play clip  r=reset doses  q=quit")
 
-    with HandFaceOverlay(HAND_MODEL_PATH, FACE_MODEL_PATH) as overlay:
+    with HandFaceOverlay(HAND_MODEL_PATH, FACE_MODEL_PATH, POSE_MODEL_PATH) as overlay:
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -500,10 +575,18 @@ def main():
             held = draw_overlay(frame, mp_result, tracked_boxes)
 
             # ── Update item trackers + log events ────────────────────────────
+            med_detected  = False
+            med_hand_near = False
+            med_events: list[str] = []
             for item, tracker in trackers.items():
                 obs    = _build_observation(item, last_detections, held,
                                             mp_result, auto_zones)
+                if item == "medication":
+                    med_detected  = obs.detected
+                    med_hand_near = obs.hand_near
                 events = tracker.update(obs)
+                if item == "medication":
+                    med_events = [e.event for e in events]
                 for ev in events:
                     clip_path = None
                     if ev.event in CLIP_EVENTS:
@@ -521,6 +604,39 @@ def main():
 
             # feed current small frame to any active clip jobs
             clip_saver.feed(small, raw_ts)
+
+            # ── Dose monitor ──────────────────────────────────────────────────
+            wrists_and_tips = mp_result.pose_wrists + mp_result.pose_index_tips
+
+            dose_events = monitor.update(
+                trackers["medication"].state,
+                med_events,
+                med_detected,
+                med_hand_near,
+                wrists_and_tips,
+                mp_result.mouth_center,
+                mp_result.mouth_visible,
+                mp_result.shoulder_width,
+                raw_ts,
+                time.time(),
+            )
+            for dev in dose_events:
+                clip_path = None
+                if dev.save_clip:
+                    clip_path = clip_saver.trigger(
+                        "medication", dev.event,
+                        buffer.snapshot(pre_s=6.0),
+                        dev.ts_wall,
+                    )
+                store.log("medication", dev.event, detail=dev.detail,
+                          confidence=0.0, ts=dev.ts_wall, clip_path=clip_path)
+                print(f"[dose] {dev.event}"
+                      + (f" ({dev.detail})" if dev.detail else "")
+                      + (" [clip]" if clip_path else ""))
+                if dev.event == "repeat_reach":
+                    banner_msg = (BANNER_TEXT, time.perf_counter() + 8.0)
+                elif dev.event == "possible_second_dose":
+                    banner_msg = (BANNER_SECOND_TEXT, time.perf_counter() + 8.0)
 
             # ── Draw YOLO boxes ───────────────────────────────────────────────
             all_zone_classes = ZONE_ITEM | ZONE_SURFACE | ZONE_SINGLE
@@ -551,14 +667,19 @@ def main():
                     cv2.putText(frame, label, (x1, max(y1 - 6, 12)),
                                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick)
 
-            # ── Status panel + answer overlay ─────────────────────────────────
-            _draw_status_panel(frame, trackers)
+            # ── Status panel + answer overlay + banner ────────────────────────
+            _draw_status_panel(frame, trackers, monitor)
 
             now_pc = time.perf_counter()
             if answer_msg and now_pc < answer_msg[1]:
                 _draw_answer(frame, answer_msg[0])
-            elif answer_msg and now_pc >= answer_msg[1]:
+            elif answer_msg:
                 answer_msg = None
+
+            if banner_msg and now_pc < banner_msg[1]:
+                _draw_banner(frame, banner_msg[0])
+            elif banner_msg:
+                banner_msg = None
 
             # ── FPS ───────────────────────────────────────────────────────────
             t_now = time.perf_counter()
@@ -579,6 +700,7 @@ def main():
                         clip_frames    = []
                         clip_frame_idx = 0
 
+            _draw_dose_debug(frame, monitor.debug_state(raw_ts))
             cv2.imshow("Recall preview", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -588,6 +710,11 @@ def main():
                 last_asked_item = item_key
                 answer_msg      = (where_is(trackers[item_key]),
                                    time.perf_counter() + 4.0)
+            elif key == ord("r"):
+                now_r = time.perf_counter()
+                if now_r - last_reset_t >= 1.0:   # ignore key repeat
+                    monitor.reset_doses()
+                last_reset_t = now_r
             elif key == ord("c"):
                 if last_asked_item:
                     path = store.last_clip_path(last_asked_item)
