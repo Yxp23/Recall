@@ -1,14 +1,20 @@
 """
-Step 1 preview: camera + YOLO-World detection.
+Step 2 preview: camera + YOLO-World detection + hands/face overlay.
 Run from repo root: python backend/scripts/preview.py
 """
+import sys
 import time
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
+sys.path.insert(0, "backend")
+from recall.vision.hands import HandFaceOverlay, draw_overlay
+
 CAMERA_INDEX = 0
-MODEL_PATH = "models/yolov8l-worldv2.pt"
+MODEL_PATH        = "models/yolov8l-worldv2.pt"
+HAND_MODEL_PATH   = "models/hand_landmarker.task"
+FACE_MODEL_PATH   = "models/face_landmarker.task"
 IMGSZ = 640
 
 CLASSES = [
@@ -16,14 +22,12 @@ CLASSES = [
     "mug", "cup", "can", "jar", "bottle", "water bottle", "book", "notebook",
     "paper", "pen", "laptop", "keyboard", "monitor", "bag", "backpack",
     "plate", "bowl", "spoon", "person",
-    # more specific vocabulary for better recall
     "chip can", "jar with lid", "travel mug", "tumbler", "spice jar",
     "computer monitor", "cable",
 ]
 
 TRACKED = {"glasses", "wallet", "pill bottle"}
 
-# Maps raw class name → clean display label
 DISPLAY_NAME = {
     "chip can":         "can",
     "jar with lid":     "jar",
@@ -36,11 +40,10 @@ DISPLAY_NAME = {
 
 CONF_TRACKED    = 0.25
 CONF_OTHER      = 0.35
-CONF_LABEL      = 0.50   # non-tracked: show text only above this
+CONF_LABEL      = 0.50
 IOU_SUPPRESS    = 0.6
-DETECT_INTERVAL = 2      # run inference every Nth frame; reuse boxes in between
+DETECT_INTERVAL = 2
 
-# Distinct colors for tracked classes (BGR)
 TRACKED_COLORS = {
     "glasses":     (0,   255,   0),
     "wallet":      (255, 128,   0),
@@ -50,7 +53,6 @@ GRAY = (180, 180, 180)
 
 
 def iou(a, b):
-    """Intersection-over-union for two (x1,y1,x2,y2) boxes."""
     ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
     ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
@@ -62,13 +64,10 @@ def iou(a, b):
 
 
 def suppress(detections):
-    """Remove lower-confidence box when IoU with a higher-confidence box > IOU_SUPPRESS."""
-    # detections: list of (conf, x1, y1, x2, y2, cls_name)
     detections = sorted(detections, key=lambda d: d[0], reverse=True)
     kept = []
     for cand in detections:
-        box_c = cand[1:5]
-        if all(iou(box_c, k[1:5]) <= IOU_SUPPRESS for k in kept):
+        if all(iou(cand[1:5], k[1:5]) <= IOU_SUPPRESS for k in kept):
             kept.append(cand)
     return kept
 
@@ -100,61 +99,73 @@ def main():
 
     print(f"Camera {CAMERA_INDEX} opened. Device: {device}. Press q to quit.")
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("Frame read failed — camera disconnected?")
-            break
+    with HandFaceOverlay(HAND_MODEL_PATH, FACE_MODEL_PATH) as overlay:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("Frame read failed — camera disconnected?")
+                break
 
-        if frame_idx % DETECT_INTERVAL == 0:
-            # Run with the lower threshold; filter non-tracked in Python
-            results = model.predict(source=frame, conf=CONF_TRACKED,
-                                    imgsz=IMGSZ, device=device, verbose=False)
-            detections = []
-            for r in results:
-                for box in r.boxes:
-                    cls_name = CLASSES[int(box.cls[0])]
-                    conf = float(box.conf[0])
-                    if cls_name not in TRACKED and conf < CONF_OTHER:
-                        continue
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    detections.append((conf, x1, y1, x2, y2, cls_name))
-            last_detections = suppress(detections)
-        frame_idx += 1
+            # ── YOLO every Nth frame ──────────────────────────────────────────
+            if frame_idx % DETECT_INTERVAL == 0:
+                results = model.predict(source=frame, conf=CONF_TRACKED,
+                                        imgsz=IMGSZ, device=device, verbose=False)
+                detections = []
+                for r in results:
+                    for box in r.boxes:
+                        cls_name = CLASSES[int(box.cls[0])]
+                        conf = float(box.conf[0])
+                        if cls_name not in TRACKED and conf < CONF_OTHER:
+                            continue
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        detections.append((conf, x1, y1, x2, y2, cls_name))
+                last_detections = suppress(detections)
+            frame_idx += 1
 
-        detections = last_detections
+            # ── MediaPipe every frame ─────────────────────────────────────────
+            mp_result = overlay.process(frame)
 
-        for conf, x1, y1, x2, y2, cls_name in detections:
-            is_tracked = cls_name in TRACKED
-            display = DISPLAY_NAME.get(cls_name, cls_name)
-            if is_tracked:
-                color      = TRACKED_COLORS[cls_name]
-                thickness  = 3
-                font_scale = 0.65
-                font_thick = 2
-                label      = f"{display} {conf:.2f}"
-            else:
-                color      = GRAY
-                thickness  = 1
-                font_scale = 0.45
-                font_thick = 1
-                label      = f"{display} {conf:.2f}" if conf >= CONF_LABEL else None
+            # Build tracked-box list for held-item check
+            tracked_boxes = [
+                (x1, y1, x2, y2, cls_name)
+                for _, x1, y1, x2, y2, cls_name in last_detections
+                if cls_name in TRACKED
+            ]
+            held = draw_overlay(frame, mp_result, tracked_boxes)
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            if label:
-                cv2.putText(frame, label, (x1, max(y1 - 6, 12)),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick)
+            # ── Draw YOLO boxes ───────────────────────────────────────────────
+            for conf, x1, y1, x2, y2, cls_name in last_detections:
+                is_tracked = cls_name in TRACKED
+                display = DISPLAY_NAME.get(cls_name, cls_name)
+                if is_tracked:
+                    color      = TRACKED_COLORS[cls_name]
+                    thickness  = 3
+                    font_scale = 0.65
+                    font_thick = 2
+                    suffix = " IN HAND" if cls_name in held else ""
+                    label  = f"{display} {conf:.2f}{suffix}"
+                else:
+                    color      = GRAY
+                    thickness  = 1
+                    font_scale = 0.45
+                    font_thick = 1
+                    label      = f"{display} {conf:.2f}" if conf >= CONF_LABEL else None
 
-        t_now = time.perf_counter()
-        inst_fps = 1.0 / max(t_now - t_prev, 1e-6)
-        t_prev = t_now
-        fps_smooth = 0.9 * fps_smooth + 0.1 * inst_fps
-        cv2.putText(frame, f"FPS {fps_smooth:.1f}", (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                if label:
+                    cv2.putText(frame, label, (x1, max(y1 - 6, 12)),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick)
 
-        cv2.imshow("Recall preview", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            # ── FPS ───────────────────────────────────────────────────────────
+            t_now = time.perf_counter()
+            fps_smooth = 0.9 * fps_smooth + 0.1 / max(t_now - t_prev, 1e-6)
+            t_prev = t_now
+            cv2.putText(frame, f"FPS {fps_smooth:.1f}", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            cv2.imshow("Recall preview", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     cap.release()
     cv2.destroyAllWindows()
