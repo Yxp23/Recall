@@ -1,0 +1,6 @@
+ultralytics
+mediapipe
+opencv-python
+faster-whisper
+fastapi
+uvicorn
