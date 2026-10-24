@@ -4,6 +4,7 @@ SQLite event log.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,7 @@ class EventStore:
     def __init__(self, path: str = "data/recall.db") -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._lock = threading.Lock()   # log() is called from the loop and background threads
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS events (
@@ -38,13 +40,14 @@ class EventStore:
             detail: str = "", confidence: float = 0.0,
             ts: Optional[float] = None,
             clip_path: Optional[str] = None) -> None:
-        self._conn.execute(
-            "INSERT INTO events"
-            "  (ts, item, event, zone, detail, confidence, clip_path)"
-            "  VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ts or time.time(), item, event, zone, detail, confidence, clip_path),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO events"
+                "  (ts, item, event, zone, detail, confidence, clip_path)"
+                "  VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ts or time.time(), item, event, zone, detail, confidence, clip_path),
+            )
+            self._conn.commit()
 
     def last_event(self, item: str,
                    event: Optional[str] = None) -> Optional[sqlite3.Row]:

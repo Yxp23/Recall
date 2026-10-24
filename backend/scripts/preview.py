@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Optional
 import cv2
 import numpy as np
@@ -454,6 +455,29 @@ def _draw_banner(frame: np.ndarray, text: str) -> None:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, (60, 130, 255), 2)
 
 
+def _draw_reset_flash(frame: np.ndarray) -> None:
+    """Center confirmation: 'Doses reset' + a drawn check (Hershey fonts have no ✓)."""
+    text  = "Doses reset"
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thick = 1.4, 3
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+    check_w = 50
+    total_w = tw + 24 + check_w
+    cx, cy  = frame.shape[1] // 2, frame.shape[0] // 2
+    x0      = cx - total_w // 2
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0 - 24, cy - th - 24), (x0 + total_w + 24, cy + 24),
+                  (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
+
+    green = (90, 220, 120)
+    cv2.putText(frame, text, (x0, cy), font, scale, green, thick)
+    bx, by = x0 + tw + 24, cy - th // 2
+    cv2.polylines(frame, [np.array([(bx, by), (bx + 14, by + 16), (bx + check_w, by - 20)])],
+                  False, green, 6)
+
+
 def _load_clip(path: str) -> tuple[list[np.ndarray], float]:
     """Return (frames, seconds_per_frame) for a clip file, or ([], 1/15) on failure."""
     cap = cv2.VideoCapture(path)
@@ -510,6 +534,7 @@ def main():
     t_prev          = time.perf_counter()
     frame_idx       = 0
     last_reset_t    = 0.0
+    reset_flash_until = 0.0   # perf_counter deadline for the "Doses reset" flash
     last_detections: list[tuple] = []
 
     print(f"Camera {CAMERA_INDEX} opened. Device: {device}.")
@@ -607,6 +632,9 @@ def main():
 
             # ── Dose monitor ──────────────────────────────────────────────────
             wrists_and_tips = mp_result.pose_wrists + mp_result.pose_index_tips
+            for hnd in mp_result.hands:   # palm center + thumb/index/middle tips
+                wrists_and_tips.append(hnd.palm_center)
+                wrists_and_tips += [hnd.landmarks[i] for i in (4, 8, 12)]
 
             dose_events = monitor.update(
                 trackers["medication"].state,
@@ -676,6 +704,9 @@ def main():
             elif answer_msg:
                 answer_msg = None
 
+            if now_pc < reset_flash_until:
+                _draw_reset_flash(frame)
+
             if banner_msg and now_pc < banner_msg[1]:
                 _draw_banner(frame, banner_msg[0])
             elif banner_msg:
@@ -712,9 +743,11 @@ def main():
                                    time.perf_counter() + 4.0)
             elif key == ord("r"):
                 now_r = time.perf_counter()
-                if now_r - last_reset_t >= 1.0:   # ignore key repeat
+                print(f"[dose] {datetime.now().strftime('%H:%M:%S.%f')[:-3]} r pressed")
+                if now_r - last_reset_t >= 1.0:   # debounce vs. last *reset*
+                    last_reset_t = now_r
+                    reset_flash_until = now_r + 2.0
                     monitor.reset_doses()
-                last_reset_t = now_r
             elif key == ord("c"):
                 if last_asked_item:
                     path = store.last_clip_path(last_asked_item)
