@@ -1,56 +1,122 @@
 """
-Step 2 preview: camera + YOLO-World detection + hands/face overlay.
+Step 3b preview: camera + YOLO-World + hands/face overlay + auto zones + item memory.
 Run from repo root: python backend/scripts/preview.py
+Keys: g=where is glasses  w=where is wallet  m=where is medication  q=quit
 """
+import json
+import os
 import sys
+import threading
 import time
+from typing import Optional
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 sys.path.insert(0, "backend")
-from recall.vision.hands import HandFaceOverlay, draw_overlay
+from recall.vision.hands   import HandFaceOverlay, draw_overlay
+from recall.events.tracker import ItemTracker, Observation, State
+from recall.events.store   import EventStore
+from recall.events.answers import where_is, state_label
+from recall.events.clips   import RollingBuffer, ClipSaver, CLIP_EVENTS
 
-CAMERA_INDEX = 0
-MODEL_PATH        = "models/yolov8l-worldv2.pt"
-HAND_MODEL_PATH   = "models/hand_landmarker.task"
-FACE_MODEL_PATH   = "models/face_landmarker.task"
-IMGSZ = 640
+CAMERA_INDEX    = 0
+MODEL_PATH      = "models/yolov8l-worldv2.pt"
+HAND_MODEL_PATH = "models/hand_landmarker.task"
+FACE_MODEL_PATH = "models/face_landmarker.task"
+IMGSZ           = 640
 
-CLASSES = [
-    "glasses", "wallet", "pill bottle", "keys", "phone", "remote control",
-    "mug", "cup", "can", "jar", "bottle", "water bottle", "book", "notebook",
+def _load_item_descriptions(path: str = "data/items.json") -> tuple[list[str], dict[str, str]]:
+    """Return (extra_phrases, phrase→item_name) from items.json, or empty if missing."""
+    if not os.path.exists(path):
+        return [], {}
+    with open(path) as f:
+        data = json.load(f)
+    phrases, display = [], {}
+    for item_name, phrase_list in data.items():
+        for phrase in phrase_list:
+            if phrase not in display:   # first occurrence wins
+                phrases.append(phrase)
+                display[phrase] = item_name
+    return phrases, display
+
+
+_item_phrases, _item_display = _load_item_descriptions()
+
+# glasses synonyms — all map to "glasses"
+GLASSES_CLASSES: set[str] = {"eyeglasses", "reading glasses", "spectacles"}
+
+# base medication vocab — all map to "medication"
+MEDICATION_CLASSES: set[str] = {
+    "pill bottle", "medicine bottle", "supplement bottle", "vitamin bottle",
+    "prescription bottle", "blister pack", "pill pack", "pills", "medicine box",
+}
+# merge in any extra phrases from items.json that belong to "medication"
+MEDICATION_CLASSES |= {p for p, n in _item_display.items() if n == "medication"}
+
+_CLASSES_BASE = [
+    "glasses", "wallet", "keys", "phone", "remote control",
+    "mug", "cup", "can", "jar", "book", "notebook",
     "paper", "pen", "laptop", "keyboard", "monitor", "bag", "backpack",
     "plate", "bowl", "spoon", "person",
-    "chip can", "jar with lid", "travel mug", "tumbler", "spice jar",
+    "chip can", "jar with lid", "travel mug", "tumbler",
     "computer monitor", "cable",
+    # zone surface classes
+    "basket", "tray", "table", "desk", "shelf",
+    # glasses synonyms
+    *sorted(GLASSES_CLASSES),
+    # medication
+    *sorted(MEDICATION_CLASSES),
 ]
+# append any items.json phrases not already present
+_base_set = set(_CLASSES_BASE)
+CLASSES = _CLASSES_BASE + [p for p in _item_phrases if p not in _base_set]
 
-TRACKED = {"glasses", "wallet", "pill bottle"}
+TRACKED      = {"glasses", "wallet"} | GLASSES_CLASSES | MEDICATION_CLASSES
+# each detection becomes its own zone keyed by class name
+ZONE_ITEM    = {"basket", "tray", "bowl"}
+# largest detection of these collapses to one "counter" zone
+ZONE_SURFACE = {"table", "desk"}
+# "shelf" gets its own zone per detection
+ZONE_SINGLE  = {"shelf"}
 
 DISPLAY_NAME = {
     "chip can":         "can",
     "jar with lid":     "jar",
     "travel mug":       "travel mug",
     "tumbler":          "travel mug",
-    "spice jar":        "jar",
     "computer monitor": "monitor",
     "monitor":          "monitor",
+    **{cls: "glasses"    for cls in GLASSES_CLASSES},
+    **{cls: "medication" for cls in MEDICATION_CLASSES},
+    **_item_display,   # items.json mappings (may override, always → item name)
 }
 
-CONF_TRACKED    = 0.25
-CONF_OTHER      = 0.35
+CONF_GLASSES             = 0.18   # glasses + synonyms (new detection)
+CONF_TRACKED             = 0.25   # wallet (new detection)
+CONF_MEDICATION          = 0.15   # medication (new detection)
+CONF_OTHER               = 0.35
+CONF_TRACKING_MEDICATION = 0.08   # medication once already tracked (hysteresis)
+CONF_TRACKING_OTHER      = 0.12   # glasses/wallet once already tracked (hysteresis)
+_ALL_GLASSES    = {"glasses"} | GLASSES_CLASSES
 CONF_LABEL      = 0.50
 IOU_SUPPRESS    = 0.6
 DETECT_INTERVAL = 2
+ZONE_INTERVAL    = 30          # re-derive zones every N frames
+ZONE_EMA         = 0.3        # smoothing factor for box coordinates
+ZONE_LINGER_S    = 5.0        # keep a zone this many seconds after it vanishes
+MIN_ZONE_AREA_PX = int(0.03 * 1280 * 720)  # 3% of frame — filters phantom small zones
 
 TRACKED_COLORS = {
-    "glasses":     (0,   255,   0),
-    "wallet":      (255, 128,   0),
-    "pill bottle": (0,   128, 255),
+    "glasses":    (0,   255,   0),
+    "wallet":     (255, 128,   0),
+    "medication": (0,   128, 255),
 }
-GRAY = (180, 180, 180)
+GRAY       = (180, 180, 180)
+ZONE_COLOR = (180, 220, 255)   # single color for all auto-zones (dashed outlines)
 
+
+# ── geometry helpers ───────────────────────────────────────────────────────────
 
 def iou(a, b):
     ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
@@ -72,6 +138,269 @@ def suppress(detections):
     return kept
 
 
+def box_area(box):
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+# ── auto-zone manager ──────────────────────────────────────────────────────────
+
+class AutoZones:
+    """
+    Derives zones from YOLO detections.
+    Internal state per zone key:
+        box  : smoothed [x1, y1, x2, y2] (float)
+        name : display name
+        seen : time.perf_counter() of last detection
+    """
+
+    def __init__(self):
+        # key → {"box": np.array, "name": str, "seen": float}
+        self._zones: dict[str, dict] = {}
+
+    def update(self, detections: list[tuple]) -> None:
+        """
+        detections: list of (conf, x1, y1, x2, y2, cls_name)
+        """
+        now = time.perf_counter()
+        seen_keys: set[str] = set()
+
+        # collect zone-class detections
+        items:    list[tuple[str, str, tuple]] = []   # (key, name, box4)
+        surfaces: list[tuple]                  = []   # (area, box4)
+
+        for _, x1, y1, x2, y2, cls_name in detections:
+            box = (x1, y1, x2, y2)
+            if cls_name in ZONE_ITEM or cls_name in ZONE_SINGLE:
+                # unique key per class+position so multiple baskets get separate zones
+                key = f"{cls_name}_{x1}_{y1}"
+                # deduplicate: if we already have a close key, reuse it
+                key = self._nearest_key(cls_name, box) or key
+                items.append((key, cls_name, box))
+            elif cls_name in ZONE_SURFACE:
+                surfaces.append((box_area(box), box))
+
+        # largest surface → "counter"
+        if surfaces:
+            surfaces.sort(reverse=True)
+            key, name, box = "counter", "counter", surfaces[0][1]
+            items.append((key, name, box))
+
+        # apply EMA or register new (skip zones smaller than MIN_ZONE_AREA_PX)
+        for key, name, box in items:
+            if box_area(box) < MIN_ZONE_AREA_PX:
+                continue
+            box_arr = np.array(box, dtype=float)
+            if key in self._zones:
+                prev = self._zones[key]["box"]
+                self._zones[key]["box"]  = prev + ZONE_EMA * (box_arr - prev)
+                self._zones[key]["seen"] = now
+            else:
+                self._zones[key] = {"box": box_arr, "name": name, "seen": now}
+            seen_keys.add(key)
+
+        # expire stale zones
+        self._zones = {
+            k: v for k, v in self._zones.items()
+            if now - v["seen"] <= ZONE_LINGER_S
+        }
+
+    def _nearest_key(self, cls_name: str, box: tuple) -> str | None:
+        """Return existing key for same class whose smoothed box overlaps this one."""
+        for key, v in self._zones.items():
+            if v["name"] == cls_name:
+                sb = v["box"].astype(int)
+                if iou(box, tuple(sb)) > 0.3:
+                    return key
+        return None
+
+    def zone_for_center(self, cx: int, cy: int) -> str | None:
+        """Return name of the smallest zone containing (cx, cy)."""
+        candidates = []
+        for v in self._zones.values():
+            x1, y1, x2, y2 = v["box"].astype(int)
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                candidates.append((box_area((x1, y1, x2, y2)), v["name"]))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    def draw(self, canvas: np.ndarray) -> None:
+        """Draw dashed outlines + name labels for all active zones."""
+        for v in self._zones.values():
+            x1, y1, x2, y2 = v["box"].astype(int)
+            _draw_dashed_rect(canvas, x1, y1, x2, y2, ZONE_COLOR)
+            cv2.putText(canvas, v["name"], (x1 + 4, y1 + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, ZONE_COLOR, 1)
+
+
+def _draw_dashed_rect(img, x1, y1, x2, y2, color, dash=10, gap=6):
+    """Draw a rectangle with dashed lines."""
+    pts = [(x1, y1, x2, y1), (x2, y1, x2, y2),
+           (x2, y2, x1, y2), (x1, y2, x1, y1)]
+    for ax, ay, bx, by in pts:
+        length = int(((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5)
+        if length == 0:
+            continue
+        dx, dy = (bx - ax) / length, (by - ay) / length
+        pos = 0
+        drawing = True
+        while pos < length:
+            seg = dash if drawing else gap
+            end = min(pos + seg, length)
+            if drawing:
+                p1 = (int(ax + pos * dx), int(ay + pos * dy))
+                p2 = (int(ax + end * dx), int(ay + end * dy))
+                cv2.line(img, p1, p2, color, 1)
+            pos = end
+            drawing = not drawing
+
+
+# ── item-memory helpers ────────────────────────────────────────────────────────
+
+LOGICAL_ITEMS = ["glasses", "wallet", "medication"]
+
+
+def _logical_item(cls_name: str) -> str:
+    """Map raw YOLO class name to logical tracked item name."""
+    return DISPLAY_NAME.get(cls_name, cls_name)
+
+
+def _item_is_held(item: str, held: set[str]) -> bool:
+    if item == "glasses":
+        return bool(_ALL_GLASSES & held)
+    if item == "medication":
+        return bool(MEDICATION_CLASSES & held)
+    return item in held
+
+
+def _boxes_overlap(a: tuple, b: tuple) -> bool:
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+
+def _hand_near_box(box: tuple, hands, radius: int = 80) -> bool:
+    """True if any hand landmark bbox comes within `radius` px of item box."""
+    x1, y1, x2, y2 = box
+    ex1, ey1, ex2, ey2 = x1 - radius, y1 - radius, x2 + radius, y2 + radius
+    for hand in hands:
+        xs = [p[0] for p in hand.landmarks]
+        ys = [p[1] for p in hand.landmarks]
+        if ex1 < max(xs) and ex2 > min(xs) and ey1 < max(ys) and ey2 > min(ys):
+            return True
+    return False
+
+
+def _build_observation(item: str, last_detections: list, held: set[str],
+                        mp_result, auto_zones) -> Observation:
+    now = time.perf_counter()
+    best_conf, best_box, best_cls = 0.0, None, None
+    for conf, x1, y1, x2, y2, cls_name in last_detections:
+        if cls_name not in TRACKED:
+            continue
+        if _logical_item(cls_name) != item:
+            continue
+        if conf > best_conf:
+            best_conf, best_box, best_cls = conf, (x1, y1, x2, y2), cls_name
+
+    if best_box is None:
+        return Observation(detected=False, box=None, zone=None,
+                           held=False, worn=False, hand_near=False,
+                           confidence=0.0, ts=now)
+
+    # bottom-center for zone assignment (item rests on surface at its base)
+    bcx = (best_box[0] + best_box[2]) // 2
+    bcy = best_box[3]
+    zone = auto_zones.zone_for_center(bcx, bcy)
+
+    is_held = _item_is_held(item, held)
+    is_worn = False
+    if item == "glasses":
+        # primary: glasses box overlaps face landmark bounding box
+        if mp_result.face_box is not None and _boxes_overlap(best_box, mp_result.face_box):
+            is_worn = True
+        # fallback: glasses center (not bottom) is inside top 35% of a "person" box
+        if not is_worn:
+            gcx = bcx
+            gcy = (best_box[1] + best_box[3]) // 2   # true vertical center for face check
+            for _, px1, py1, px2, py2, pcls in last_detections:
+                if pcls != "person":
+                    continue
+                top35_y = py1 + int(0.35 * (py2 - py1))
+                if px1 <= gcx <= px2 and py1 <= gcy <= top35_y:
+                    is_worn = True
+                    break
+
+    hand_near = _hand_near_box(best_box, mp_result.hands) if best_box else False
+
+    return Observation(detected=True, box=best_box, zone=zone,
+                       held=is_held, worn=is_worn, hand_near=hand_near,
+                       confidence=best_conf, ts=now)
+
+
+def _draw_status_panel(frame: np.ndarray, trackers: dict[str, ItemTracker]) -> None:
+    """Top-right panel showing each item's current state."""
+    lines = [f"{item:<12}{state_label(t)}" for item, t in trackers.items()]
+    pad, lh = 8, 22
+    w_panel = 260
+    h_panel = pad * 2 + lh * len(lines)
+    x0 = frame.shape[1] - w_panel - 10
+    y0 = 10
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + w_panel, y0 + h_panel), (30, 30, 30), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (x0 + pad, y0 + pad + lh * (i + 1) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+
+
+def _draw_answer(frame: np.ndarray, text: str) -> None:
+    """Bottom-center answer overlay, word-wrapped at ~50 chars."""
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > 52:
+            lines.append(cur.rstrip())
+            cur = w + " "
+        else:
+            cur += w + " "
+    if cur.strip():
+        lines.append(cur.rstrip())
+
+    lh      = 28
+    h_total = lh * len(lines) + 16
+    y0      = frame.shape[0] - h_total - 20
+    x0      = 20
+    w_box   = frame.shape[1] - 40
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0 - 6, y0 - 6),
+                  (x0 + w_box, y0 + h_total), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (x0, y0 + lh * (i + 1)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 200), 2)
+
+
+def _load_clip(path: str) -> tuple[list[np.ndarray], float]:
+    """Return (frames, seconds_per_frame) for a clip file, or ([], 1/15) on failure."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return [], 1 / 15
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 15
+    frames = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        frames.append(f)
+    cap.release()
+    return frames, 1.0 / max(fps, 1)
+
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
 def main():
     model = YOLO(MODEL_PATH)
     model.set_classes(CLASSES)
@@ -92,12 +421,25 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    fps_smooth = 0.0
-    t_prev = time.perf_counter()
-    frame_idx = 0
-    last_detections = []
+    auto_zones      = AutoZones()
+    trackers        = {item: ItemTracker(item) for item in LOGICAL_ITEMS}
+    store           = EventStore()
+    buffer          = RollingBuffer(duration_s=10.0)
+    clip_saver      = ClipSaver(out_dir="data/clips")
+    answer_msg:      Optional[tuple[str, float]] = None   # (text, expire_perf_ts)
+    last_asked_item: Optional[str]               = None   # for c key
+    clip_frames:     list[np.ndarray]            = []     # loaded clip for playback
+    clip_frame_idx:  int                         = 0
+    clip_frame_spf:  float                       = 1 / 15  # seconds per frame
+    clip_next_ts:    float                       = 0.0
 
-    print(f"Camera {CAMERA_INDEX} opened. Device: {device}. Press q to quit.")
+    fps_smooth      = 0.0
+    t_prev          = time.perf_counter()
+    frame_idx       = 0
+    last_detections: list[tuple] = []
+
+    print(f"Camera {CAMERA_INDEX} opened. Device: {device}.")
+    print("g=glasses  w=wallet  m=medication  c=play clip  q=quit")
 
     with HandFaceOverlay(HAND_MODEL_PATH, FACE_MODEL_PATH) as overlay:
         while True:
@@ -106,26 +448,50 @@ def main():
                 print("Frame read failed — camera disconnected?")
                 break
 
+            # ── Buffer raw frame (before any overlays) ────────────────────────
+            raw_ts  = time.perf_counter()
+            small   = buffer.push(frame.copy(), raw_ts)
+
             # ── YOLO every Nth frame ──────────────────────────────────────────
             if frame_idx % DETECT_INTERVAL == 0:
+                all_zone_classes = ZONE_ITEM | ZONE_SURFACE | ZONE_SINGLE
                 results = model.predict(source=frame, conf=CONF_TRACKED,
                                         imgsz=IMGSZ, device=device, verbose=False)
-                detections = []
+                raw = []
                 for r in results:
                     for box in r.boxes:
                         cls_name = CLASSES[int(box.cls[0])]
                         conf = float(box.conf[0])
-                        if cls_name not in TRACKED and conf < CONF_OTHER:
+                        is_zone = cls_name in all_zone_classes
+                        logical  = _logical_item(cls_name)
+                        tracking = (logical in trackers and trackers[logical].is_tracking)
+                        if tracking:
+                            min_conf = (CONF_TRACKING_MEDICATION if cls_name in MEDICATION_CLASSES
+                                        else CONF_TRACKING_OTHER if cls_name in TRACKED
+                                        else CONF_OTHER)
+                        else:
+                            min_conf = (CONF_MEDICATION if cls_name in MEDICATION_CLASSES
+                                        else CONF_GLASSES if cls_name in _ALL_GLASSES
+                                        else CONF_TRACKED if cls_name in TRACKED
+                                        else CONF_OTHER)
+                        if not is_zone and conf < min_conf:
                             continue
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        detections.append((conf, x1, y1, x2, y2, cls_name))
-                last_detections = suppress(detections)
+                        raw.append((conf, x1, y1, x2, y2, cls_name))
+                last_detections = suppress(raw)
+
+            # ── Update zones every ZONE_INTERVAL frames ───────────────────────
+            if frame_idx % ZONE_INTERVAL == 0:
+                auto_zones.update(last_detections)
+
             frame_idx += 1
+
+            # ── Draw zones ────────────────────────────────────────────────────
+            auto_zones.draw(frame)
 
             # ── MediaPipe every frame ─────────────────────────────────────────
             mp_result = overlay.process(frame)
 
-            # Build tracked-box list for held-item check
             tracked_boxes = [
                 (x1, y1, x2, y2, cls_name)
                 for _, x1, y1, x2, y2, cls_name in last_detections
@@ -133,17 +499,46 @@ def main():
             ]
             held = draw_overlay(frame, mp_result, tracked_boxes)
 
+            # ── Update item trackers + log events ────────────────────────────
+            for item, tracker in trackers.items():
+                obs    = _build_observation(item, last_detections, held,
+                                            mp_result, auto_zones)
+                events = tracker.update(obs)
+                for ev in events:
+                    clip_path = None
+                    if ev.event in CLIP_EVENTS:
+                        clip_path = clip_saver.trigger(
+                            ev.item, ev.event,
+                            buffer.snapshot(pre_s=6.0),
+                            ev.ts_wall,
+                        )
+                    store.log(ev.item, ev.event, ev.zone,
+                              ev.detail, ev.confidence, ev.ts_wall,
+                              clip_path=clip_path)
+                    print(f"[{ev.item}] {ev.event}"
+                          + (f" → {ev.zone}" if ev.zone else "")
+                          + (" [clip]" if clip_path else ""))
+
+            # feed current small frame to any active clip jobs
+            clip_saver.feed(small, raw_ts)
+
             # ── Draw YOLO boxes ───────────────────────────────────────────────
+            all_zone_classes = ZONE_ITEM | ZONE_SURFACE | ZONE_SINGLE
             for conf, x1, y1, x2, y2, cls_name in last_detections:
+                if cls_name in all_zone_classes:
+                    continue
                 is_tracked = cls_name in TRACKED
-                display = DISPLAY_NAME.get(cls_name, cls_name)
+                display    = DISPLAY_NAME.get(cls_name, cls_name)
                 if is_tracked:
-                    color      = TRACKED_COLORS[cls_name]
+                    cx, cy    = (x1 + x2) // 2, (y1 + y2) // 2
+                    zone_name = auto_zones.zone_for_center(cx, cy)
+                    color      = TRACKED_COLORS.get(display, TRACKED_COLORS.get(cls_name, GRAY))
                     thickness  = 3
                     font_scale = 0.65
                     font_thick = 2
-                    suffix = " IN HAND" if cls_name in held else ""
-                    label  = f"{display} {conf:.2f}{suffix}"
+                    suffix     = (" IN HAND" if cls_name in held
+                                  else (f" · {zone_name}" if zone_name else ""))
+                    label      = f"{display} {conf:.2f}{suffix}"
                 else:
                     color      = GRAY
                     thickness  = 1
@@ -156,6 +551,15 @@ def main():
                     cv2.putText(frame, label, (x1, max(y1 - 6, 12)),
                                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick)
 
+            # ── Status panel + answer overlay ─────────────────────────────────
+            _draw_status_panel(frame, trackers)
+
+            now_pc = time.perf_counter()
+            if answer_msg and now_pc < answer_msg[1]:
+                _draw_answer(frame, answer_msg[0])
+            elif answer_msg and now_pc >= answer_msg[1]:
+                answer_msg = None
+
             # ── FPS ───────────────────────────────────────────────────────────
             t_now = time.perf_counter()
             fps_smooth = 0.9 * fps_smooth + 0.1 / max(t_now - t_prev, 1e-6)
@@ -163,10 +567,45 @@ def main():
             cv2.putText(frame, f"FPS {fps_smooth:.1f}", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-            cv2.imshow("Recall preview", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            # ── Clip playback (main thread — macOS requirement) ───────────────
+            if clip_frames:
+                now_pc = time.perf_counter()
+                if now_pc >= clip_next_ts:
+                    cv2.imshow("Recall clip", clip_frames[clip_frame_idx])
+                    clip_frame_idx += 1
+                    clip_next_ts    = now_pc + clip_frame_spf
+                    if clip_frame_idx >= len(clip_frames):
+                        cv2.destroyWindow("Recall clip")
+                        clip_frames    = []
+                        clip_frame_idx = 0
 
+            cv2.imshow("Recall preview", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key in (ord("g"), ord("w"), ord("m")):
+                item_key        = {"g": "glasses", "w": "wallet", "m": "medication"}[chr(key)]
+                last_asked_item = item_key
+                answer_msg      = (where_is(trackers[item_key]),
+                                   time.perf_counter() + 4.0)
+            elif key == ord("c"):
+                if last_asked_item:
+                    path = store.last_clip_path(last_asked_item)
+                    if path and os.path.exists(path):
+                        frames, spf = _load_clip(path)
+                        if frames:
+                            clip_frames    = frames
+                            clip_frame_idx = 0
+                            clip_frame_spf = spf
+                            clip_next_ts   = time.perf_counter()
+                        else:
+                            print(f"[clip] could not load {path}")
+                    else:
+                        print(f"[clip] no clip found for {last_asked_item}")
+                else:
+                    print("[clip] press g / w / m first to select an item")
+
+    store.close()
     cap.release()
     cv2.destroyAllWindows()
 

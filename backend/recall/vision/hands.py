@@ -33,6 +33,7 @@ class HandResult:
 class OverlayResult:
     hands: list[HandResult] = field(default_factory=list)
     mouth_center: Optional[tuple[int, int]] = None
+    face_box: Optional[tuple[int, int, int, int]] = None   # (x1, y1, x2, y2) pixel
 
 
 class HandFaceOverlay:
@@ -102,14 +103,18 @@ class HandFaceOverlay:
             cy = int(sum(p[1] for p in palm_pts) / len(palm_pts))
             hands.append(HandResult(landmarks=pts, palm_center=(cx, cy)))
 
-        mouth: Optional[tuple[int, int]] = None
+        mouth:    Optional[tuple[int, int]]          = None
+        face_box: Optional[tuple[int, int, int, int]] = None
         if face_res.face_landmarks:
             lms = face_res.face_landmarks[0]
             ux, uy = int(lms[_MOUTH_UPPER].x * w), int(lms[_MOUTH_UPPER].y * h)
             lx, ly = int(lms[_MOUTH_LOWER].x * w), int(lms[_MOUTH_LOWER].y * h)
             mouth = ((ux + lx) // 2, (uy + ly) // 2)
+            xs = [int(lm.x * w) for lm in lms]
+            ys = [int(lm.y * h) for lm in lms]
+            face_box = (min(xs), min(ys), max(xs), max(ys))
 
-        return OverlayResult(hands=hands, mouth_center=mouth)
+        return OverlayResult(hands=hands, mouth_center=mouth, face_box=face_box)
 
 
 # ── drawing helpers ────────────────────────────────────────────────────────────
