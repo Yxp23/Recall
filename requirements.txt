@@ -1,6 +1,10 @@
+# Python 3.12, macOS (Apple Silicon)
 ultralytics
 mediapipe
 opencv-python
+numpy
 faster-whisper
+imageio-ffmpeg
 fastapi
 uvicorn
+websockets
