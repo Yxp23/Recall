@@ -99,6 +99,8 @@ class DoseMonitor:
         self._last_event: str = ""
         self._closest_ratio: Optional[float] = None
 
+        self.audio_enabled = True   # False = alerts still emit events, but no sound on this Mac
+
         self._doses: list[float] = []
         self._unclears: list[float] = []   # unclear pickups held ≥ UNCLEAR_MIN_HELD_S (repeat window)
         self._unclear_count = 0            # all dose_unclear events since reset (panel)
@@ -171,7 +173,8 @@ class DoseMonitor:
 
                 if self._prior_activity_in_window(ts_wall):
                     self._is_repeat = True
-                    play_repeat_alert()   # first thing: audio must not wait on anything
+                    if self.audio_enabled:
+                        play_repeat_alert()   # first thing: audio must not wait on anything
                     ev = DoseEvent(
                         event="repeat_reach",
                         ts_wall=ts_wall,
@@ -221,6 +224,18 @@ class DoseMonitor:
 
         self._prev_med_state = med_state
         return events
+
+    @property
+    def doses_today(self) -> int:
+        return len(self._doses)
+
+    @property
+    def last_dose_ts(self) -> Optional[float]:
+        return self._doses[-1] if self._doses else None
+
+    @property
+    def unclear_count(self) -> int:
+        return self._unclear_count
 
     def record_dose(self, ts_wall: float) -> None:
         self._doses.append(ts_wall)

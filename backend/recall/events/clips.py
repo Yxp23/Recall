@@ -116,15 +116,42 @@ class ClipSaver:
 
 # ── writer ─────────────────────────────────────────────────────────────────────
 
+def _reencode_h264(src: str, dst: str) -> bool:
+    """Re-encode src → dst as H.264/yuv420p with imageio-ffmpeg. False on any failure."""
+    try:
+        import subprocess
+        import imageio_ffmpeg
+        subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", src,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+             "-an", dst],
+            check=True, timeout=60,
+        )
+        return os.path.exists(dst)
+    except Exception as e:
+        print(f"[clip] H.264 re-encode failed ({e}); keeping mp4v")
+        return False
+
+
 def _write_mp4(path: str, frames: list[tuple[float, np.ndarray]]) -> None:
     if not frames:
         return
     duration = frames[-1][0] - frames[0][0] if len(frames) > 1 else 1.0
     fps = max(5.0, min(30.0, len(frames) / max(duration, 0.1)))
     h, w = frames[0][1].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
+    # Write to a temp name and rename when done, so a clip URL only resolves
+    # once the (browser-playable H.264) file is complete.
+    tmp = path[:-4] + ".part.mp4"
+    writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"avc1"), fps, (w, h))
+    h264 = writer.isOpened()
+    if not h264:
+        writer.release()
+        writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
     for _, f in frames:
         writer.write(f)
     writer.release()
+    if h264 or not _reencode_h264(tmp, path):
+        os.replace(tmp, path)   # (non-H.264 fallback is still playable in the OpenCV preview)
+    else:
+        os.remove(tmp)
     print(f"[clip] {os.path.basename(path)}  ({len(frames)} frames @ {fps:.0f} fps)")

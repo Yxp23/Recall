@@ -51,26 +51,36 @@ class EventStore:
 
     def last_event(self, item: str,
                    event: Optional[str] = None) -> Optional[sqlite3.Row]:
-        if event:
+        with self._lock:
+            if event:
+                return self._conn.execute(
+                    "SELECT * FROM events WHERE item=? AND event=?"
+                    " ORDER BY ts DESC LIMIT 1",
+                    (item, event),
+                ).fetchone()
             return self._conn.execute(
-                "SELECT * FROM events WHERE item=? AND event=?"
-                " ORDER BY ts DESC LIMIT 1",
-                (item, event),
+                "SELECT * FROM events WHERE item=? ORDER BY ts DESC LIMIT 1",
+                (item,),
             ).fetchone()
-        return self._conn.execute(
-            "SELECT * FROM events WHERE item=? ORDER BY ts DESC LIMIT 1",
-            (item,),
-        ).fetchone()
 
     def last_clip_path(self, item: str) -> Optional[str]:
         """Return path of the most recent clip for item, or None."""
-        row = self._conn.execute(
-            "SELECT clip_path FROM events"
-            " WHERE item=? AND clip_path IS NOT NULL"
-            " ORDER BY ts DESC LIMIT 1",
-            (item,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT clip_path FROM events"
+                " WHERE item=? AND clip_path IS NOT NULL"
+                " ORDER BY ts DESC LIMIT 1",
+                (item,),
+            ).fetchone()
         return row["clip_path"] if row else None
+
+    def recent_events(self, limit: int = 50) -> list[sqlite3.Row]:
+        """Newest-first event rows."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
     def close(self) -> None:
         self._conn.close()
