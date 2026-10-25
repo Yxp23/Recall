@@ -1,0 +1,208 @@
+@import "tailwindcss";
+@import "./theme.css";
+
+@property --rim-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* Base resets live in @layer base and component classes in @layer components so that
+   Tailwind utilities (text-on-label, px-6, font-medium…) always win over them. */
+@layer base {
+html,
+body,
+#root {
+  min-height: 100%;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--label);
+  font-family: var(--font-sans);
+  font-size: 17px;
+  line-height: 22px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  -webkit-tap-highlight-color: transparent;
+}
+button {
+  font: inherit;
+  color: inherit;
+}
+}
+
+@layer components {
+/* ── glass material ────────────────────────────────────────────────────────── */
+
+.glass {
+  position: relative;
+  isolation: isolate;
+  border-radius: var(--r, var(--r-28));
+  padding: var(--pad, 0px);
+  background: var(--glass-fill);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  box-shadow: var(--glass-highlight), var(--glass-shadow);
+  color: var(--label);
+}
+/* 1px specular rim: conic gradient masked to the border; the bright angle follows the pointer */
+.glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(
+    from var(--rim-angle),
+    var(--glass-rim-hi),
+    var(--glass-rim-lo) 18%,
+    var(--glass-rim-lo) 42%,
+    var(--glass-rim-hi) 50%,
+    var(--glass-rim-lo) 68%,
+    var(--glass-rim-lo) 92%,
+    var(--glass-rim-hi)
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  pointer-events: none;
+  z-index: 1;
+}
+/* concentric radii: inner = outer − padding */
+.inner-r {
+  border-radius: max(calc(var(--r, var(--r-28)) - var(--pad, 0px)), var(--r-10));
+}
+/* lens refraction where SVG backdrop filters render (Chromium) */
+html.lens .glass[data-lens="true"] {
+  -webkit-backdrop-filter: blur(14px) saturate(180%) url(#lens-filter);
+  backdrop-filter: blur(14px) saturate(180%) url(#lens-filter);
+}
+
+/* ── pressable surfaces ────────────────────────────────────────────────────── */
+.pressable {
+  transition: background-color var(--dur-fast);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.pressable:active {
+  background-color: var(--fill);
+}
+
+/* ── inset grouped lists ───────────────────────────────────────────────────── */
+.group {
+  background: var(--card);
+  border-radius: var(--r-20);
+  overflow: hidden;
+}
+.row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  min-height: var(--row-min);
+  padding: var(--s-2) var(--s-4);
+  text-align: left;
+  width: 100%;
+}
+.group > * {
+  position: relative;
+}
+.group > :not(:first-child)::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: var(--sep-inset);
+  right: 0;
+  height: 0.5px;
+  background: var(--separator);
+  z-index: 1;
+}
+.group[data-inset="icon"] {
+  --sep-inset: calc(var(--s-4) + var(--icon-box) + var(--s-3));
+}
+
+/* ── navigation bar: blur material behind the collapsed large title ────────── */
+.navbar {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 30;
+  height: calc(var(--row-min) + env(safe-area-inset-top, 0px));
+  padding-top: env(safe-area-inset-top, 0px);
+  pointer-events: none;
+}
+.navbar-material {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 0.5px solid var(--separator);
+}
+
+/* ── liquid selection bubble ───────────────────────────────────────────────── */
+.bubble {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  pointer-events: none;
+  will-change: transform, width;
+  z-index: 0; /* behind the labels, which sit at z-index 1 */
+  background: var(--bubble-fill);
+  box-shadow: var(--bubble-shadow), var(--glass-highlight);
+  transition: background-color var(--dur-base), box-shadow var(--dur-base),
+    backdrop-filter var(--dur-base), -webkit-backdrop-filter var(--dur-base);
+}
+.bubble[data-lifted="true"] {
+  background: var(--bubble-fill-lifted);
+  box-shadow: var(--bubble-shadow-lifted), var(--glass-highlight);
+  -webkit-backdrop-filter: blur(3px) saturate(220%) brightness(1.08);
+  backdrop-filter: blur(3px) saturate(220%) brightness(1.08);
+}
+html.lens .bubble[data-lifted="true"] {
+  -webkit-backdrop-filter: blur(2px) saturate(220%) brightness(1.08) url(#lens-filter);
+  backdrop-filter: blur(2px) saturate(220%) brightness(1.08) url(#lens-filter);
+}
+.tab-label {
+  max-height: var(--s-4);
+  overflow: hidden;
+  transition: max-height var(--dur-base), opacity var(--dur-fast);
+}
+[data-compact="true"] .tab-label {
+  max-height: 0;
+  opacity: 0;
+}
+
+/* ── hub video ─────────────────────────────────────────────────────────────── */
+.hub-video {
+  filter: brightness(0.82) saturate(1.05) sepia(0.14);
+}
+
+/* ── hub zone outlines: thin and soft; the most recently moved item's zone is highlighted ── */
+.zone {
+  border: 1px solid var(--label-3);
+  background: transparent;
+  transition: border-color var(--dur-base), background-color var(--dur-base), box-shadow var(--dur-base);
+}
+.zone[data-hot="true"] {
+  border-color: var(--hub-accent);
+  background: color-mix(in srgb, var(--hub-accent) 10%, transparent);
+  box-shadow: 0 0 0 1px var(--hub-accent);
+}
+
+/* ── accessibility ─────────────────────────────────────────────────────────── */
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  html.lens .glass[data-lens="true"] {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    background: var(--glass-solid);
+  }
+  .bubble[data-lifted="true"],
+  html.lens .bubble[data-lifted="true"] {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+}

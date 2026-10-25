@@ -7,7 +7,9 @@ Run from the repo root via backend/scripts/serve.sh.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from pathlib import Path
 import threading
 import time
 import traceback
@@ -20,12 +22,16 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from recall.pipeline import (
     CLIPS_DIR, LOGICAL_ITEMS, Pipeline, clip_url_for, event_message,
 )
+
+ITEMS_JSON   = "data/items.json"
+FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
 STREAM_FPS   = 10
 JPEG_QUALITY = 70
@@ -82,7 +88,7 @@ class Runner:
 
     def _run(self) -> None:
         try:
-            pipe = Pipeline()
+            pipe = Pipeline(hud=False)   # clean stream: the web UI draws its own status, FPS and dose panel
             pipe.start()
             pipe.set_talk_to_mom(self.talk_to_mom)
             self.pipe = pipe
@@ -240,6 +246,27 @@ def api_events(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
     } for r in rows]
 
 
+_DEFAULT_SCHEDULE = [
+    {"label": "Morning", "time": "08:00"},
+    {"label": "Afternoon", "time": "14:00"},
+    {"label": "Evening", "time": "20:00"},
+]
+
+
+@app.get("/api/config")
+def api_config() -> dict:
+    """Dose schedule + caregiver contact, from data/items.json."""
+    try:
+        with open(ITEMS_JSON) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    return {
+        "schedule":  data.get("schedule") or _DEFAULT_SCHEDULE,
+        "mom_phone": data.get("mom_phone", ""),
+    }
+
+
 @app.get("/clips/{filename}")
 def get_clip(filename: str) -> FileResponse:
     if (filename != os.path.basename(filename) or not filename.endswith(".mp4")
@@ -327,3 +354,41 @@ connect();
 @app.get("/debug", response_class=HTMLResponse)
 def debug_page() -> str:
     return _DEBUG_HTML
+
+
+# ── frontend (built by `npm run build` in frontend/) ───────────────────────────
+# Hub at /, caregiver at /care — same single-page app, routed client-side.
+
+_NOT_BUILT = HTMLResponse(
+    "<h3>Frontend not built</h3><p>Run <code>cd frontend &amp;&amp; npm install &amp;&amp; npm run build</code>, "
+    "then reload. (API, streams and <a href='/debug'>/debug</a> work without it.)</p>",
+    status_code=503,
+)
+
+
+def _index() -> Response:
+    index = FRONTEND_DIST / "index.html"
+    if not index.is_file():
+        return _NOT_BUILT
+    return FileResponse(index, headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/", include_in_schema=False)
+def hub_page() -> Response:
+    return _index()
+
+
+@app.get("/care", include_in_schema=False)
+@app.get("/care/", include_in_schema=False)
+def care_page() -> Response:
+    return _index()
+
+
+if (FRONTEND_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon() -> Response:
+    f = FRONTEND_DIST / "favicon.svg"
+    return FileResponse(f) if f.is_file() else Response(status_code=404)

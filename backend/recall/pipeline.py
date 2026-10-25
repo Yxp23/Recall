@@ -26,7 +26,11 @@ from recall.events.answers import where_is, state_label
 from recall.events.clips   import RollingBuffer, ClipSaver, CLIP_EVENTS
 from recall.events.dose    import DoseMonitor, BANNER_TEXT, BANNER_SECOND_TEXT
 
-CAMERA_INDEX    = 0
+# OpenCV's device order on this Mac (verified by grabbing frames, not the same as the
+# system list): 0 = iPhone (Continuity Camera, 1920x1080), 1 = FaceTime HD Camera.
+# The order can change if the iPhone isn't connected when the app starts, so check
+# the "Camera N opened" line at startup. Override: RECALL_CAMERA=1 ./backend/scripts/serve.sh
+CAMERA_INDEX    = int(os.environ.get("RECALL_CAMERA", "0"))
 MODEL_PATH      = "models/yolov8l-worldv2.pt"
 HAND_MODEL_PATH = "models/hand_landmarker.task"
 FACE_MODEL_PATH = "models/face_landmarker.task"
@@ -41,7 +45,11 @@ def _load_item_descriptions(path: str = "data/items.json") -> tuple[list[str], d
         data = json.load(f)
     phrases, display = [], {}
     for item_name, phrase_list in data.items():
+        if not isinstance(phrase_list, list):   # e.g. "mom_phone"
+            continue
         for phrase in phrase_list:
+            if not isinstance(phrase, str):     # e.g. "schedule" entries
+                continue
             if phrase not in display:   # first occurrence wins
                 phrases.append(phrase)
                 display[phrase] = item_name
@@ -70,6 +78,7 @@ _CLASSES_BASE = [
     "computer monitor", "cable",
     # zone surface classes
     "basket", "tray", "table", "desk", "shelf",
+    "wicker basket", "storage basket", "laundry basket",   # all become the "basket" zone
     # glasses synonyms
     *sorted(GLASSES_CLASSES),
     # medication
@@ -79,9 +88,13 @@ _CLASSES_BASE = [
 _base_set = set(_CLASSES_BASE)
 CLASSES = _CLASSES_BASE + [p for p in _item_phrases if p not in _base_set]
 
-TRACKED      = {"glasses", "wallet"} | GLASSES_CLASSES | MEDICATION_CLASSES
+# wallet vocabulary — all map to "wallet"
+WALLET_CLASSES: set[str] = {"wallet"} | {p for p, n in _item_display.items() if n == "wallet"}
+
+TRACKED      = WALLET_CLASSES | {"glasses"} | GLASSES_CLASSES | MEDICATION_CLASSES
 # each detection becomes its own zone keyed by class name
-ZONE_ITEM    = {"basket", "tray", "bowl"}
+ZONE_ALIAS   = {"wicker basket": "basket", "storage basket": "basket", "laundry basket": "basket"}
+ZONE_ITEM    = {"basket", "tray", "bowl"} | set(ZONE_ALIAS)
 # largest detection of these collapses to one "counter" zone
 ZONE_SURFACE = {"table", "desk"}
 # "shelf" gets its own zone per detection
@@ -101,18 +114,26 @@ DISPLAY_NAME = {
 
 CONF_GLASSES             = 0.18   # glasses + synonyms (new detection)
 CONF_TRACKED             = 0.25   # wallet (new detection)
-CONF_MEDICATION          = 0.15   # medication (new detection)
+CONF_MEDICATION          = 0.25   # medication (new detection) — high: a false "pill bottle" is unsafe
 CONF_OTHER               = 0.35
-CONF_TRACKING_MEDICATION = 0.08   # medication once already tracked (hysteresis)
+CONF_TRACKING_MEDICATION = 0.15   # medication once already tracked (hysteresis)
 CONF_TRACKING_OTHER      = 0.12   # glasses/wallet once already tracked (hysteresis)
 _ALL_GLASSES    = {"glasses"} | GLASSES_CLASSES
+CONF_FLOOR      = min(CONF_TRACKING_MEDICATION, CONF_TRACKING_OTHER)   # YOLO must return everything we might keep
+
+# Medication sanity checks (a wallet once triggered dose alerts)
+MED_MIN_ASPECT   = 1.1    # height / width — bottles and boxes stand upright
+MED_MAX_AREA     = 0.15   # fraction of the frame
+MED_COMPETE_IOU  = 0.4    # a medication box this overlapped with a competitor is dropped
+MED_COMPETITORS  = WALLET_CLASSES | {"book", "phone", "notebook"}
 CONF_LABEL      = 0.50
 IOU_SUPPRESS    = 0.6
 DETECT_INTERVAL = 2
-ZONE_INTERVAL    = 30          # re-derive zones every N frames
+ZONE_INTERVAL    = DETECT_INTERVAL   # re-derive zones after every detection run (flicker-proof with the linger below)
+CONF_ZONE_ITEM   = 0.15        # baskets / trays / bowls / shelves are often detected with low confidence
 ZONE_EMA         = 0.3        # smoothing factor for box coordinates
-ZONE_LINGER_S    = 5.0        # keep a zone this many seconds after it vanishes
-MIN_ZONE_AREA_PX = int(0.03 * 1280 * 720)  # 3% of frame — filters phantom small zones
+ZONE_LINGER_S    = 15.0       # keep a zone this many seconds after it vanishes
+MIN_ZONE_AREA_PX = int(0.015 * 1280 * 720)  # 1.5% of frame — filters phantom small zones
 
 TRACKED_COLORS = {
     "glasses":    (0,   255,   0),
@@ -149,6 +170,14 @@ def box_area(box):
     return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
 
 
+def medication_shape_ok(x1: int, y1: int, x2: int, y2: int, frame_area: int) -> bool:
+    """Taller than wide (h/w ≥ 1.1) and under 15% of the frame; anything else isn't medication."""
+    w, h = x2 - x1, y2 - y1
+    if w <= 0 or h <= 0:
+        return False
+    return h / w >= MED_MIN_ASPECT and (w * h) / frame_area < MED_MAX_AREA
+
+
 # ── auto-zone manager ──────────────────────────────────────────────────────────
 
 class AutoZones:
@@ -177,6 +206,7 @@ class AutoZones:
 
         for _, x1, y1, x2, y2, cls_name in detections:
             box = (x1, y1, x2, y2)
+            cls_name = ZONE_ALIAS.get(cls_name, cls_name)
             if cls_name in ZONE_ITEM or cls_name in ZONE_SINGLE:
                 # unique key per class+position so multiple baskets get separate zones
                 key = f"{cls_name}_{x1}_{y1}"
@@ -224,6 +254,24 @@ class AutoZones:
         """JSON-friendly list of active zones."""
         return [{"name": v["name"], "box": [int(c) for c in v["box"]]}
                 for v in list(self._zones.values())]
+
+    def zone_for_box(self, box: tuple) -> str | None:
+        """Zone an item sits in. A specific zone (basket, tray…) wins over the big counter, and the
+        item's center counts before its bottom edge, so things lying in a basket aren't 'on the counter'."""
+        x1, y1, x2, y2 = box
+        pts = [((x1 + x2) // 2, (y1 + y2) // 2), ((x1 + x2) // 2, y2)]
+        for specific_only in (True, False):
+            for cx, cy in pts:
+                hits = []
+                for v in list(self._zones.values()):
+                    if specific_only and v["name"] == "counter":
+                        continue
+                    zx1, zy1, zx2, zy2 = v["box"].astype(int)
+                    if zx1 <= cx <= zx2 and zy1 <= cy <= zy2:
+                        hits.append((box_area((zx1, zy1, zx2, zy2)), v["name"]))
+                if hits:
+                    return min(hits)[1]
+        return None
 
     def zone_for_center(self, cx: int, cy: int) -> str | None:
         """Return name of the smallest zone containing (cx, cy)."""
@@ -283,6 +331,8 @@ def _item_is_held(item: str, held: set[str]) -> bool:
         return bool(_ALL_GLASSES & held)
     if item == "medication":
         return bool(MEDICATION_CLASSES & held)
+    if item == "wallet":
+        return bool(WALLET_CLASSES & held)
     return item in held
 
 
@@ -319,10 +369,7 @@ def _build_observation(item: str, last_detections: list, held: set[str],
                            held=False, worn=False, hand_near=False,
                            confidence=0.0, ts=now)
 
-    # bottom-center for zone assignment (item rests on surface at its base)
-    bcx = (best_box[0] + best_box[2]) // 2
-    bcy = best_box[3]
-    zone = auto_zones.zone_for_center(bcx, bcy)
+    zone = auto_zones.zone_for_box(best_box)
 
     is_held = _item_is_held(item, held)
     is_worn = False
@@ -560,8 +607,12 @@ class FrameResult:
 class Pipeline:
     """Owns camera, models, trackers, dose monitor, clips and store."""
 
-    def __init__(self, camera_index: int = CAMERA_INDEX) -> None:
+    def __init__(self, camera_index: int = CAMERA_INDEX, hud: bool = True) -> None:
         self.camera_index = camera_index
+        # hud=True (the OpenCV preview): status panel, FPS, dose-debug box, answer/banner/flash
+        # text. hud=False (the web UI): the annotated frame carries only detection boxes with
+        # labels, zone outlines and the hand/pose skeleton; the UI draws everything else itself.
+        self.hud = hud
         self.fps = 0.0
         self.last_alert: Optional[dict] = None
 
@@ -572,6 +623,7 @@ class Pipeline:
         self._reset_flash_until = 0.0
         self._last_reset_t = 0.0
 
+        self.frame_size = (1280, 720)   # (w, h) of the camera frame
         self._frame_idx = 0
         self._t_prev = time.perf_counter()
         self._last_detections: list[tuple] = []
@@ -606,7 +658,21 @@ class Pipeline:
         self.clip_saver = ClipSaver(out_dir=CLIPS_DIR)
         self.overlay    = HandFaceOverlay(HAND_MODEL_PATH, FACE_MODEL_PATH, POSE_MODEL_PATH)
 
-        print(f"Camera {self.camera_index} opened. Device: {self.device}.")
+        # Continuity Camera can open fine yet stream pure black (phone locked, lens covered,
+        # session not started). Say so loudly instead of silently running on black.
+        w0 = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h0 = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        brightest = 0.0
+        t0 = time.time()
+        while time.time() - t0 < 4.0 and brightest < 2.0:
+            ok, f = self.cap.read()
+            if ok:
+                brightest = max(brightest, float(f.mean()))
+        print(f"Camera {self.camera_index} opened ({w0}x{h0}). Device: {self.device}.")
+        if brightest < 2.0:
+            print(f"WARNING: camera {self.camera_index} is streaming black frames. If this is the iPhone: "
+                  "unlock it, keep it upright with the rear camera uncovered, and make sure no other app "
+                  "is using it. (RECALL_CAMERA=1 uses the Mac's camera.)")
         print(f"Doses loaded from DB: {len(self.monitor._doses)}")
 
     def close(self) -> None:
@@ -655,12 +721,15 @@ class Pipeline:
             "ts":           time.time(),
             "items":        items,
             "zones":        self.auto_zones.snapshot(),
+            "frame":        list(self.frame_size),
             "doses_today":  self.monitor.doses_today,
+            "dose_times":   self.monitor.dose_times,
             "last_dose_ts": self.monitor.last_dose_ts,
             "unclear":      self.monitor.unclear_count,
             "last_alert":   self.last_alert,
             "fps":          round(self.fps, 1),
             "talk_to_mom":  self.monitor.audio_enabled,
+            "dose":         self.monitor.debug_state(time.perf_counter()),
         }
 
     # ── per-frame ──────────────────────────────────────────────────────────────
@@ -677,13 +746,15 @@ class Pipeline:
 
         # ── Buffer raw frame (before any overlays) ────────────────────────────
         raw_ts = time.perf_counter()
+        frame_area = frame.shape[0] * frame.shape[1]
+        self.frame_size = (frame.shape[1], frame.shape[0])
         raw    = frame.copy()
         small  = buffer.push(raw, raw_ts)
 
         # ── YOLO every Nth frame ──────────────────────────────────────────────
         if self._frame_idx % DETECT_INTERVAL == 0:
             all_zone_classes = ZONE_ITEM | ZONE_SURFACE | ZONE_SINGLE
-            results = self.model.predict(source=frame, conf=CONF_TRACKED,
+            results = self.model.predict(source=frame, conf=CONF_FLOOR,
                                          imgsz=IMGSZ, device=self.device, verbose=False)
             found = []
             for r in results:
@@ -702,10 +773,22 @@ class Pipeline:
                                     else CONF_GLASSES if cls_name in _ALL_GLASSES
                                     else CONF_TRACKED if cls_name in TRACKED
                                     else CONF_OTHER)
-                    if not is_zone and conf < min_conf:
+                    if is_zone:
+                        zone_min = CONF_ZONE_ITEM if cls_name in (ZONE_ITEM | ZONE_SINGLE) else CONF_TRACKED
+                        if conf < zone_min:
+                            continue
+                    elif conf < min_conf:
                         continue
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    if cls_name in MEDICATION_CLASSES and not medication_shape_ok(x1, y1, x2, y2, frame_area):
+                        continue
                     found.append((conf, x1, y1, x2, y2, cls_name))
+            # class competition: medication that overlaps a wallet / book / phone / notebook is that object
+            rivals = [d[1:5] for d in found if d[5] in MED_COMPETITORS]
+            if rivals:
+                found = [d for d in found
+                         if d[5] not in MEDICATION_CLASSES
+                         or all(iou(d[1:5], rv) <= MED_COMPETE_IOU for rv in rivals)]
             self._last_detections = suppress(found)
         last_detections = self._last_detections
 
@@ -731,12 +814,14 @@ class Pipeline:
         # ── Update item trackers + log events ─────────────────────────────────
         med_detected  = False
         med_hand_near = False
+        med_box = None
         med_events: list[str] = []
         for item, tracker in trackers.items():
             obs = _build_observation(item, last_detections, held, mp_result, auto_zones)
             if item == "medication":
                 med_detected  = obs.detected
                 med_hand_near = obs.hand_near
+                med_box       = obs.box
             events = tracker.update(obs)
             if item == "medication":
                 med_events = [e.event for e in events]
@@ -761,7 +846,16 @@ class Pipeline:
         clip_saver.feed(small, raw_ts)
 
         # ── Dose monitor ──────────────────────────────────────────────────────
+        hand_boxes = [
+            (min(p[0] for p in h.landmarks), min(p[1] for p in h.landmarks),
+             max(p[0] for p in h.landmarks), max(p[1] for p in h.landmarks))
+            for h in mp_result.hands
+        ]
         wrists_and_tips = mp_result.pose_wrists + mp_result.pose_index_tips
+        if med_box and trackers["medication"].state == State.IN_HAND:
+            # a held bottle at the mouth is itself a cue (hands are often hidden by the bottle)
+            mx = (med_box[0] + med_box[2]) // 2
+            wrists_and_tips += [(mx, med_box[1]), (mx, (med_box[1] + med_box[3]) // 2)]
         for hnd in mp_result.hands:   # palm center + thumb/index/middle tips
             wrists_and_tips.append(hnd.palm_center)
             wrists_and_tips += [hnd.landmarks[i] for i in (4, 8, 12)]
@@ -771,6 +865,8 @@ class Pipeline:
             med_events,
             med_detected,
             med_hand_near,
+            med_box,
+            hand_boxes,
             wrists_and_tips,
             mp_result.mouth_center,
             mp_result.mouth_visible,
@@ -808,8 +904,7 @@ class Pipeline:
             is_tracked = cls_name in TRACKED
             display    = DISPLAY_NAME.get(cls_name, cls_name)
             if is_tracked:
-                cx, cy    = (x1 + x2) // 2, (y1 + y2) // 2
-                zone_name = auto_zones.zone_for_center(cx, cy)
+                zone_name = auto_zones.zone_for_box((x1, y1, x2, y2))
                 color      = TRACKED_COLORS.get(display, TRACKED_COLORS.get(cls_name, GRAY))
                 thickness  = 3
                 font_scale = 0.65
@@ -830,20 +925,24 @@ class Pipeline:
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick)
 
         # ── Status panel + answer overlay + reset flash + banner ──────────────
-        _draw_status_panel(frame, trackers, monitor)
+        if self.hud:
+            _draw_status_panel(frame, trackers, monitor)
 
         now_pc = time.perf_counter()
         with self._lock:
             if self._answer_msg and now_pc < self._answer_msg[1]:
-                _draw_answer(frame, self._answer_msg[0])
+                if self.hud:
+                    _draw_answer(frame, self._answer_msg[0])
             elif self._answer_msg:
                 self._answer_msg = None
 
             if now_pc < self._reset_flash_until:
-                _draw_reset_flash(frame)
+                if self.hud:
+                    _draw_reset_flash(frame)
 
             if self._banner_msg and now_pc < self._banner_msg[1]:
-                _draw_banner(frame, self._banner_msg[0])
+                if self.hud:
+                    _draw_banner(frame, self._banner_msg[0])
             elif self._banner_msg:
                 self._banner_msg = None
 
@@ -854,8 +953,8 @@ class Pipeline:
         t_now = time.perf_counter()
         self.fps = 0.9 * self.fps + 0.1 / max(t_now - self._t_prev, 1e-6)
         self._t_prev = t_now
-        cv2.putText(frame, f"FPS {self.fps:.1f}", (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-        _draw_dose_debug(frame, monitor.debug_state(raw_ts))
+        if self.hud:
+            cv2.putText(frame, f"FPS {self.fps:.1f}", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            _draw_dose_debug(frame, monitor.debug_state(raw_ts))
         return FrameResult(annotated=frame, raw=raw, events=out)
