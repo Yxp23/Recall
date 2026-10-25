@@ -72,5 +72,37 @@ export interface Config {
   items?: Record<string, string[]>;
 }
 
+/** One test type in the eval results (data/eval.json → breakdown). */
+export interface EvalRow {
+  label: string;
+  trials: number;
+  passes: number;
+  rate: number; // 0..1
+  avg_alert_seconds: number | null;
+  reasons: Record<string, number>; // why the failures failed, from the event log
+}
+/** data/eval.json: fractions 0..1, false_taken as a count. */
+export interface EvalData {
+  trials?: number;
+  doses_detected?: number;
+  false_taken?: number;
+  repeat_alerts?: number;
+  where_correct?: number;
+  door_alerts?: number;
+  avg_alert_seconds?: number;
+  breakdown?: Record<string, EvalRow>;
+}
+/** live messages while the eval tool runs */
+export interface EvalMsg {
+  type: "eval";
+  kind: "started" | "finished" | "reset";
+  trial?: string;
+  label?: string;
+  deadline?: number | null;
+  toast?: string;
+  ok?: boolean;
+  data?: EvalData;
+}
+
 export const ITEMS = ["glasses", "wallet", "medication"] as const;
 export type ItemName = (typeof ITEMS)[number];

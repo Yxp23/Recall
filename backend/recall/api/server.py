@@ -28,6 +28,7 @@ from pydantic import BaseModel
 
 from recall.audio import TTS, play_voice_file
 from recall.cameras import door_camera_index
+from recall.evaltool import EvalTool
 from recall.door import DoorCamera
 from recall.pipeline import (
     CLIPS_DIR, LOGICAL_ITEMS, Pipeline, clip_url_for, event_message,
@@ -336,6 +337,49 @@ def api_config() -> dict:
         "mom_phone": data.get("mom_phone", ""),
         "items":     items,
     }
+
+
+_eval_tool: Optional[EvalTool] = None
+
+
+def _eval() -> EvalTool:
+    """The eval tool needs the event log, so it is created when the pipeline is up."""
+    global _eval_tool
+    if _eval_tool is None:
+        _eval_tool = EvalTool(_pipe().store, hub.publish_threadsafe)
+    return _eval_tool
+
+
+class EvalStartBody(BaseModel):
+    type: str
+
+
+class EvalMarkBody(BaseModel):
+    correct: bool
+
+
+@app.post("/api/eval/start")
+def api_eval_start(body: EvalStartBody) -> dict:
+    try:
+        return _eval().start(body.type)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/eval/mark")
+def api_eval_mark(body: EvalMarkBody) -> dict:
+    return {"ok": _eval().mark(body.correct)}
+
+
+@app.post("/api/eval/reset")
+def api_eval_reset() -> dict:
+    _eval().reset()
+    return {"ok": True}
+
+
+@app.get("/api/eval/status")
+def api_eval_status() -> dict:
+    return _eval().status()
 
 
 @app.get("/api/eval")

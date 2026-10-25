@@ -5,7 +5,7 @@ import { Icon } from "../ui/Icon";
 import { spring } from "../ui/motion";
 import { ITEM_LABEL, clock, isKnown, sentence, where } from "../lib/format";
 import type { Slot } from "../lib/schedule";
-import type { EventMsg, Snapshot } from "../lib/types";
+import type { EvalData, EventMsg, Snapshot } from "../lib/types";
 import { ITEMS } from "../lib/types";
 
 const ICON = { glasses: Glasses, wallet: Wallet, medication: Pill } as const;
@@ -65,11 +65,14 @@ const MODELS = [
   ["MediaPipe Pose", "wrists, mouth, shoulders"],
 ];
 
-export function JudgePanel({ snap, events, onHow, voiceTimes }: {
+const pct = (v: number | undefined) => (v === undefined ? "—" : `${Math.round(v * 100)}%`);
+
+export function JudgePanel({ snap, events, onHow, voiceTimes, evalData }: {
   snap: Snapshot | null;
   events: EventMsg[];
   onHow: () => void;
   voiceTimes: { ms: number; server: number | null } | null;
+  evalData: EvalData | null;
 }) {
   const d = snap?.dose;
   return (
@@ -154,6 +157,25 @@ export function JudgePanel({ snap, events, onHow, voiceTimes }: {
           </span>
         </div>
       </div>
+
+      {!!evalData?.trials && (
+        <div className="inner-r t-footnote tabular mb-4 flex flex-col gap-1 bg-fill p-3">
+          <div className="t-subhead font-semibold">Tested · {evalData.trials} trials</div>
+          {[
+            ["Doses detected", pct(evalData.doses_detected)],
+            ["False “taken”", evalData.false_taken === undefined ? "—" : String(evalData.false_taken)],
+            ["Second-dose alerts", pct(evalData.repeat_alerts)],
+            ["Alert time", evalData.avg_alert_seconds === undefined ? "—" : `${evalData.avg_alert_seconds} s`],
+            ["Where answers", pct(evalData.where_correct)],
+            ["Door alerts", pct(evalData.door_alerts)],
+          ].map(([k, v]) => (
+            <div key={k} className="flex justify-between">
+              <span className="text-label-2">{k}</span>
+              <span className="font-semibold">{v}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="t-caption min-h-0 flex-1 overflow-y-auto pr-1 font-mono">
         <AnimatePresence initial={false}>

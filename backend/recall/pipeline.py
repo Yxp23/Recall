@@ -82,6 +82,10 @@ _CLASSES_BASE = [
     "plate", "bowl", "spoon", "person",
     "chip can", "jar with lid", "travel mug", "tumbler",
     "computer monitor", "cable",
+    # look-alikes of a pill bottle: detected so they can be told apart, never tracked or used as zones
+    "air freshener", "spray bottle", "lotion bottle", "hand sanitizer", "deodorant", "perfume bottle",
+    "soap dispenser", "candle", "salt shaker", "coffee mug", "glass of water", "water bottle",
+    "snack bag", "speaker",
     # zone surface classes
     "basket", "tray", "table", "desk", "shelf",
     "wicker basket", "storage basket", "laundry basket",   # all become the "basket" zone
@@ -98,10 +102,19 @@ CLASSES = _CLASSES_BASE + [p for p in _item_phrases if p not in _base_set]
 WALLET_CLASSES: set[str] = {"wallet"} | {p for p, n in _item_display.items() if n == "wallet"}
 
 TRACKED      = WALLET_CLASSES | {"glasses"} | GLASSES_CLASSES | MEDICATION_CLASSES
+
+# Things that look like a medication bottle. Detected (at a low bar, so they win the argument), never
+# tracked, never zones: a medication box overlapping one of these is that object, not a medication.
+NEGATIVE_CLASSES: set[str] = {
+    "air freshener", "spray bottle", "lotion bottle", "hand sanitizer", "deodorant", "perfume bottle",
+    "soap dispenser", "candle", "salt shaker", "coffee mug", "mug", "cup", "glass of water", "water bottle",
+    "snack bag", "speaker", "remote control", "phone",
+}
 # each detection becomes its own zone keyed by class name
-ZONE_ALIAS   = {"wicker basket": "basket", "storage basket": "basket", "laundry basket": "basket",
-                "bowl": "basket"}   # a bowl is a basket: one zone name, so never "went into the bowl"
-ZONE_ITEM    = {"basket", "tray", "bowl"} | set(ZONE_ALIAS)
+# Only the word "basket" (and its synonyms) makes a basket zone. Bowls and trays are ordinary objects:
+# they can no longer become zones, so there is no "went into the bowl".
+ZONE_ALIAS   = {"wicker basket": "basket", "storage basket": "basket", "laundry basket": "basket"}
+ZONE_ITEM    = {"basket"} | set(ZONE_ALIAS)
 # largest detection of these collapses to one "counter" zone
 ZONE_SURFACE = {"table", "desk"}
 # "shelf" gets its own zone per detection
@@ -121,7 +134,8 @@ DISPLAY_NAME = {
 
 CONF_GLASSES             = 0.18   # glasses + synonyms (new detection)
 CONF_TRACKED             = 0.25   # wallet (new detection)
-CONF_MEDICATION          = 0.25   # medication (new detection) — high: a false "pill bottle" is unsafe
+CONF_MEDICATION          = 0.30   # medication (new detection) — high: a false "pill bottle" is unsafe
+CONF_NEGATIVE            = 0.20   # look-alikes: a low bar, so they can veto a medication box
 CONF_OTHER               = 0.35
 CONF_TRACKING_MEDICATION = 0.15   # medication once already tracked (hysteresis)
 CONF_TRACKING_OTHER      = 0.12   # glasses/wallet once already tracked (hysteresis)
@@ -132,16 +146,31 @@ CONF_FLOOR      = min(CONF_TRACKING_MEDICATION, CONF_TRACKING_OTHER)   # YOLO mu
 MED_MIN_ASPECT   = 1.1    # height / width — bottles and boxes stand upright
 MED_MAX_AREA     = 0.15   # fraction of the frame
 MED_COMPETE_IOU  = 0.4    # a medication box this overlapped with a competitor is dropped
-MED_COMPETITORS  = WALLET_CLASSES | {"book", "phone", "notebook"}
+MED_COMPETITORS  = WALLET_CLASSES | {"book", "phone", "notebook"} | NEGATIVE_CLASSES
 CONF_LABEL      = 0.50
 IOU_SUPPRESS    = 0.6
 DETECT_INTERVAL = 2
+# Pill spot lock: once the medication has rested at one spot for 5 s, a medication detection somewhere
+# else that is not being carried by a hand is a look-alike (a spray bottle, a mug…) and is ignored.
+PILL_REST_S          = 5.0
+PILL_RESTING_RADIUS_PX = 40
+PILL_LOCK_RADIUS_PX  = 150
+PILL_LOCK_TIMEOUT_S  = 60.0   # a spot that has not been seen for this long is forgotten
+
 ZONE_INTERVAL    = DETECT_INTERVAL   # re-derive zones after every detection run (flicker-proof with the linger below)
-CONF_ZONE_ITEM   = 0.15        # baskets / trays / bowls / shelves are often detected with low confidence
+CONF_ZONE_ITEM   = 0.15        # baskets / shelves are often detected with low confidence
 ZONE_EMA         = 0.3        # smoothing factor for box coordinates
 ZONE_LINGER_S    = 15.0       # keep a zone this many seconds after it vanishes
 MIN_ZONE_AREA_PX = int(0.015 * 1280 * 720)  # 1.5% of frame — filters phantom small zones
-MIN_BOWL_TRAY_AREA_PX = int(0.03 * 1280 * 720)  # bowls/trays are often cups and plates: they need to be basket-sized (3%)
+# Zone stability (see AutoZones): one basket, one counter, one shelf; a zone appears after 3 s of stable detection
+ZONE_STABLE_S    = 3.0
+ZONE_GAP_S       = 1.0         # a detection missing for longer than this starts its 3 s clock over
+ZONE_MATCH_IOU   = 0.3        # a new stable detection this close to the active zone just updates it
+ZONE_ANCHOR_IOU  = 0.5        # a detection must stay this close to where it first appeared to stay "stable"
+ZONE_MAX_CANDIDATES = 6
+ZONE_MIN_DENSITY = 0.6        # share of detection runs a candidate must be found in over its 3 s
+ZONE_MIN_FRAC    = 0.02        # basket/shelf smaller than 2% of the frame: ignored
+ZONE_MAX_FRAC    = 0.35        # …or larger than 35%: it is the room, not a basket
 
 TRACKED_COLORS = {
     "glasses":    (0,   255,   0),
@@ -202,77 +231,94 @@ def medication_shape_ok(x1: int, y1: int, x2: int, y2: int, frame_area: int) -> 
 
 # ── auto-zone manager ──────────────────────────────────────────────────────────
 
+def _zone_category(cls_name: str) -> Optional[str]:
+    """Which single zone a detection class can feed: basket, counter (table/desk), shelf."""
+    n = ZONE_ALIAS.get(cls_name, cls_name)
+    if n == "basket":
+        return "basket"
+    if n in ZONE_SURFACE:
+        return "counter"
+    if n in ZONE_SINGLE:
+        return "shelf"
+    return None
+
+
 class AutoZones:
     """
-    Derives zones from YOLO detections.
-    Internal state per zone key:
-        box  : smoothed [x1, y1, x2, y2] (float)
-        name : display name
-        seen : time.perf_counter() of last detection
+    Derives zones from YOLO detections, conservatively: at most ONE zone per kind
+    (one basket, one counter, one shelf), and a zone only appears after the same detection has been
+    stable for ZONE_STABLE_S. Moving or setting up the camera makes YOLO see lots of "baskets" for a
+    moment; those never get stable, so they never become zones.
+
+      candidates[kind] : detections being watched, each {"first", "seen", "anchor", "box", "hits", "runs"}
+      _zones[kind]     : the active zone {"box": smoothed [x1,y1,x2,y2], "name", "seen"}
     """
 
     def __init__(self):
-        # key → {"box": np.array, "name": str, "seen": float}
         self._zones: dict[str, dict] = {}
+        self._cands: dict[str, list[dict]] = {}
 
-    def update(self, detections: list[tuple]) -> None:
-        """
-        detections: list of (conf, x1, y1, x2, y2, cls_name)
-        """
+    def update(self, detections: list[tuple], frame_area: int = 1280 * 720) -> None:
+        """detections: list of (conf, x1, y1, x2, y2, cls_name)"""
         now = time.perf_counter()
-        seen_keys: set[str] = set()
-
-        # collect zone-class detections
-        items:    list[tuple[str, str, tuple]] = []   # (key, name, box4)
-        surfaces: list[tuple]                  = []   # (area, box4)
-
+        boxes: dict[str, list[tuple]] = {"basket": [], "counter": [], "shelf": []}
         for _, x1, y1, x2, y2, cls_name in detections:
-            box = (x1, y1, x2, y2)
-            if cls_name in ("bowl", "tray") and box_area(box) < MIN_BOWL_TRAY_AREA_PX:
-                continue   # too small to be a basket-like zone
-            cls_name = ZONE_ALIAS.get(cls_name, cls_name)
-            if cls_name in ZONE_ITEM or cls_name in ZONE_SINGLE:
-                # unique key per class+position so multiple baskets get separate zones
-                key = f"{cls_name}_{x1}_{y1}"
-                # deduplicate: if we already have a close key, reuse it
-                key = self._nearest_key(cls_name, box) or key
-                items.append((key, cls_name, box))
-            elif cls_name in ZONE_SURFACE:
-                surfaces.append((box_area(box), box))
-
-        # largest surface → "counter"
-        if surfaces:
-            surfaces.sort(reverse=True)
-            key, name, box = "counter", "counter", surfaces[0][1]
-            items.append((key, name, box))
-
-        # apply EMA or register new (skip zones smaller than MIN_ZONE_AREA_PX)
-        for key, name, box in items:
-            if box_area(box) < MIN_ZONE_AREA_PX:
+            kind = _zone_category(cls_name)
+            if kind is None:
                 continue
-            box_arr = np.array(box, dtype=float)
-            if key in self._zones:
-                prev = self._zones[key]["box"]
-                self._zones[key]["box"]  = prev + ZONE_EMA * (box_arr - prev)
-                self._zones[key]["seen"] = now
-            else:
-                self._zones[key] = {"box": box_arr, "name": name, "seen": now}
-            seen_keys.add(key)
+            box = (x1, y1, x2, y2)
+            frac = box_area(box) / frame_area
+            if kind in ("basket", "shelf") and not (ZONE_MIN_FRAC <= frac <= ZONE_MAX_FRAC):
+                continue   # too small to be a basket, or so big it is the room
+            if kind == "counter" and box_area(box) < MIN_ZONE_AREA_PX:
+                continue
+            boxes[kind].append(box)
+        for kind, bs in boxes.items():
+            self._update_kind(kind, bs, now)
 
-        # expire stale zones
-        self._zones = {
-            k: v for k, v in self._zones.items()
-            if now - v["seen"] <= ZONE_LINGER_S
-        }
+        # an active zone fades out after it has not been re-confirmed for a while
+        self._zones = {k: v for k, v in self._zones.items() if now - v["seen"] <= ZONE_LINGER_S}
 
-    def _nearest_key(self, cls_name: str, box: tuple) -> str | None:
-        """Return existing key for same class whose smoothed box overlaps this one."""
-        for key, v in self._zones.items():
-            if v["name"] == cls_name:
-                sb = v["box"].astype(int)
-                if iou(box, tuple(sb)) > 0.3:
-                    return key
-        return None
+    def _update_kind(self, kind: str, boxes: list[tuple], now: float) -> None:
+        cands = self._cands.setdefault(kind, [])
+
+        # 1. match this run's detections to the candidates already being watched
+        free = list(boxes)
+        for c in cands:
+            best, best_iou = None, ZONE_ANCHOR_IOU
+            for b in free:
+                # compared with where it FIRST appeared, so a chain of overlapping detections cannot
+                # "walk" a candidate across the room and make it look stable
+                v = iou(b, c["anchor"])
+                if v > best_iou:
+                    best, best_iou = b, v
+            if best is not None:
+                free.remove(best)
+                c["hits"] += 1
+                c["seen"] = now
+                c["box"] = c["box"] + ZONE_EMA * (np.array(best, dtype=float) - c["box"])
+        for c in cands:
+            c["runs"] += 1   # one more detection run this candidate has lived through
+        # 2. new, unmatched detections start a stability clock (largest first; the list stays small)
+        for b in sorted(free, key=box_area, reverse=True):
+            if len(cands) < ZONE_MAX_CANDIDATES:
+                cands.append({"first": now, "seen": now, "anchor": b, "box": np.array(b, dtype=float), "hits": 1, "runs": 1})
+        # 3. a detection that vanishes for more than ZONE_GAP_S starts over
+        cands[:] = [c for c in cands if now - c["seen"] <= ZONE_GAP_S]
+
+        # 4. the largest candidate that has been stable long enough is THE zone for this kind
+        # stable = there for 3 s AND detected on most runs (a spurious "basket" blinks in and out)
+        stable = [c for c in cands
+                  if c["seen"] - c["first"] >= ZONE_STABLE_S and c["hits"] >= ZONE_MIN_DENSITY * c["runs"]]
+        if not stable:
+            return
+        top = max(stable, key=lambda c: box_area(tuple(c["box"])))
+        active = self._zones.get(kind)
+        if active is not None and iou(tuple(top["box"]), tuple(active["box"])) > ZONE_MATCH_IOU:
+            active["box"] = active["box"] + ZONE_EMA * (top["box"] - active["box"])
+            active["seen"] = now
+        else:
+            self._zones[kind] = {"box": top["box"].copy(), "name": kind, "seen": now}
 
     def snapshot(self) -> list[dict]:
         """JSON-friendly list of active zones."""
@@ -658,6 +704,10 @@ class Pipeline:
         self._last_reset_t = 0.0
 
         self.frame_size = (1280, 720)   # (w, h) of the camera frame
+        self._pill_spot: Optional[tuple[float, float]] = None   # where the medication has been resting
+        self._pill_rest: Optional[dict] = None                  # candidate resting spot being timed
+        self._pill_seen = 0.0
+        self._pill_logged = 0.0
         self._frame_idx = 0
         self._t_prev = time.perf_counter()
         self._last_detections: list[tuple] = []
@@ -782,6 +832,64 @@ class Pipeline:
             "dose":         self.monitor.debug_state(time.perf_counter()),
         }
 
+    # ── pill spot lock ─────────────────────────────────────────────────────────
+
+    def _pill_lock(self, dets: list[tuple], hands: list, now: float) -> list[tuple]:
+        """Drop medication detections far from the spot the medication has been resting at, unless a
+        hand is carrying them. The lock lifts as soon as the medication is handled."""
+        def center(d):
+            return ((d[1] + d[3]) / 2, (d[2] + d[4]) / 2)
+
+        def far(a, b):
+            return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+        if self._pill_spot is not None and now - self._pill_seen > PILL_LOCK_TIMEOUT_S:
+            print("[pill] spot forgotten (not seen for a while)")
+            self._pill_spot = None
+        if self._pill_rest is not None and now - self._pill_rest["last"] > 2.0:
+            self._pill_rest = None
+
+        keep: list[tuple] = []
+        carried_any = False
+        for d in dets:
+            if d[5] not in MEDICATION_CLASSES:
+                keep.append(d)
+                continue
+            if _hand_near_box(d[1:5], hands, radius=30):
+                carried_any = True
+                keep.append(d)
+            elif self._pill_spot is not None and far(center(d), self._pill_spot) > PILL_LOCK_RADIUS_PX:
+                if now - self._pill_logged > 5:   # don't spam
+                    self._pill_logged = now
+                    print(f"[pill] ignored a medication detection {far(center(d), self._pill_spot):.0f}px "
+                          "from the resting spot (not in a hand): look-alike")
+            else:
+                keep.append(d)
+
+        if carried_any:   # being handled: the lock is off until it rests again
+            if self._pill_spot is not None:
+                print("[pill] spot unlocked (medication is in a hand)")
+            self._pill_spot = None
+            self._pill_rest = None
+            return keep
+
+        survivors = [d for d in keep if d[5] in MEDICATION_CLASSES]
+        if survivors:
+            c = center(max(survivors, key=lambda d: d[0]))
+            if self._pill_spot is None:
+                r = self._pill_rest
+                if r is not None and far(c, r["center"]) <= PILL_RESTING_RADIUS_PX:
+                    r["last"] = now
+                    if now - r["since"] >= PILL_REST_S:
+                        self._pill_spot, self._pill_seen = r["center"], now
+                        self._pill_rest = None
+                        print(f"[pill] spot locked at ({c[0]:.0f}, {c[1]:.0f}) after resting {PILL_REST_S:.0f}s")
+                else:
+                    self._pill_rest = {"center": c, "since": now, "last": now}
+            elif far(c, self._pill_spot) <= PILL_LOCK_RADIUS_PX:
+                self._pill_seen = now
+        return keep
+
     # ── per-frame ──────────────────────────────────────────────────────────────
 
     def step(self) -> Optional[FrameResult]:
@@ -838,6 +946,8 @@ class Pipeline:
                                     else CONF_GLASSES if cls_name in _ALL_GLASSES
                                     else CONF_TRACKED if cls_name in TRACKED
                                     else CONF_OTHER)
+                    if cls_name in NEGATIVE_CLASSES:
+                        min_conf = CONF_NEGATIVE
                     if is_zone:
                         zone_min = CONF_ZONE_ITEM if cls_name in (ZONE_ITEM | ZONE_SINGLE) else CONF_TRACKED
                         if conf < zone_min:
@@ -859,7 +969,7 @@ class Pipeline:
 
         # ── Update zones every ZONE_INTERVAL frames ───────────────────────────
         if self._frame_idx % ZONE_INTERVAL == 0:
-            auto_zones.update(last_detections)
+            auto_zones.update(last_detections, frame_area)
 
         self._frame_idx += 1
 
@@ -868,6 +978,8 @@ class Pipeline:
 
         # ── MediaPipe every frame ─────────────────────────────────────────────
         mp_result = self.overlay.process(frame)
+
+        last_detections = self._pill_lock(last_detections, mp_result.hands, raw_ts)
 
         tracked_boxes = [
             (x1, y1, x2, y2, cls_name)
@@ -961,33 +1073,19 @@ class Pipeline:
                     self._banner_msg = (text, time.perf_counter() + 8.0)
                 self.last_alert = {"event": dev.event, "message": text, "ts": dev.ts_wall}
 
-        # ── Draw YOLO boxes ───────────────────────────────────────────────────
-        all_zone_classes = ZONE_ITEM | ZONE_SURFACE | ZONE_SINGLE
+        # ── Draw boxes: ONLY glasses, wallet and medication get a box and a label ───
+        # (zones are drawn with their names above; background objects are not drawn at all)
         for conf, x1, y1, x2, y2, cls_name in last_detections:
-            if cls_name in all_zone_classes:
+            if cls_name not in TRACKED:
                 continue
-            is_tracked = cls_name in TRACKED
-            display    = DISPLAY_NAME.get(cls_name, cls_name)
-            if is_tracked:
-                zone_name = auto_zones.zone_for_box((x1, y1, x2, y2))
-                color      = TRACKED_COLORS.get(display, TRACKED_COLORS.get(cls_name, GRAY))
-                thickness  = 3
-                font_scale = 0.65
-                font_thick = 2
-                suffix     = (" IN HAND" if cls_name in held
-                              else (f" · {zone_name}" if zone_name else ""))
-                label      = f"{display} {conf:.2f}{suffix}"
-            else:
-                color      = GRAY
-                thickness  = 1
-                font_scale = 0.45
-                font_thick = 1
-                label      = f"{display} {conf:.2f}" if conf >= CONF_LABEL else None
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            if label:
-                cv2.putText(frame, label, (x1, max(y1 - 6, 12)),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick)
+            display   = DISPLAY_NAME.get(cls_name, cls_name)
+            zone_name = auto_zones.zone_for_box((x1, y1, x2, y2))
+            color     = TRACKED_COLORS.get(display, TRACKED_COLORS.get(cls_name, GRAY))
+            suffix    = (" IN HAND" if cls_name in held
+                         else (f" · {zone_name}" if zone_name else ""))
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+            cv2.putText(frame, f"{display} {conf:.2f}{suffix}", (x1, max(y1 - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
 
         # ── Status panel + answer overlay + reset flash + banner ──────────────
         if self.hud:

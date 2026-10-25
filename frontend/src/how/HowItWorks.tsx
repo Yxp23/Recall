@@ -5,7 +5,7 @@ import { Glass } from "../ui/Glass";
 import { Icon } from "../ui/Icon";
 import { spring } from "../ui/motion";
 import { ITEM_LABEL, where } from "../lib/format";
-import { ITEMS, type ItemName, type ItemSnap } from "../lib/types";
+import { ITEMS, type EvalData, type EvalRow, type ItemName, type ItemSnap } from "../lib/types";
 import { useConfig, useRecall } from "../lib/useRecall";
 import { DISCLAIMER } from "../care/copy";
 import {
@@ -52,6 +52,68 @@ function parseResults(d: EvalFile | null): Result[] | null {
   return out.length ? out : null;
 }
 
+// ── breakdown table: per test type, with why the failures failed (from the event log) ──
+
+const TEST_NAMES: Record<string, string> = {
+  dose: "Real dose",
+  fake: "Fake pickup (no mouth)",
+  second: "Second pickup",
+  where: "Where question",
+  door: "Door walk-out",
+};
+
+function BreakdownTable({ rows }: { rows: Record<string, EvalRow> }) {
+  const order = ["dose", "fake", "second", "where", "door"].filter((k) => rows[k]);
+  const th = "t-footnote px-4 py-3 text-left font-semibold text-label-2";
+  const td = "t-subhead tabular px-4 py-3 align-top";
+  return (
+    <Reveal delay={0.1} className="mt-12">
+      <div className="overflow-x-auto rounded-r28 bg-card">
+        <table className="w-full min-w-[640px] border-collapse">
+          <thead>
+            <tr className="border-b border-separator">
+              <th className={th}>Test</th>
+              <th className={th}>Trials</th>
+              <th className={th}>Passes</th>
+              <th className={th}>Pass rate</th>
+              <th className={th}>Avg alert time</th>
+              <th className={th}>Why it failed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {order.map((k, i) => {
+              const r = rows[k];
+              const fails = Object.entries(r.reasons ?? {});
+              return (
+                <tr key={k} className={i ? "border-t border-separator" : ""}>
+                  <td className={`${td} font-semibold`}>{TEST_NAMES[k] ?? r.label}</td>
+                  <td className={td}>{r.trials}</td>
+                  <td className={td}>{r.passes}</td>
+                  <td className={td}>{Math.round(r.rate * 100)}%</td>
+                  <td className={td}>{r.avg_alert_seconds != null ? `${r.avg_alert_seconds} s` : "—"}</td>
+                  <td className={td}>
+                    {fails.length ? (
+                      <span className="flex flex-wrap gap-1">
+                        {fails.map(([why, n]) => (
+                          <Chip key={why} wrap>
+                            {why} ×{n}
+                          </Chip>
+                        ))}
+                      </span>
+                    ) : (
+                      <span className="text-label-2">none</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </Reveal>
+  );
+}
+
 // ── live item state ──────────────────────────────────────────────────────────
 
 function stateText(it: ItemName, s: ItemSnap | undefined): string {
@@ -92,11 +154,15 @@ export default function HowItWorks() {
   const cfg = useConfig();
   const [results, setResults] = useState<Result[] | null>(null);
   const [resultsLoaded, setResultsLoaded] = useState(false);
+  const [breakdown, setBreakdown] = useState<Record<string, EvalRow> | null>(null);
 
   useEffect(() => {
     fetch("/api/eval")
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => setResults(parseResults(d)))
+      .then((d) => {
+        setResults(parseResults(d));
+        setBreakdown((d as EvalData | null)?.breakdown ?? null);
+      })
       .catch(() => {})
       .finally(() => setResultsLoaded(true));
   }, []);
@@ -326,6 +392,7 @@ export default function HowItWorks() {
               </div>
             </Reveal>
           )}
+          {breakdown && Object.keys(breakdown).length > 0 && <BreakdownTable rows={breakdown} />}
         </Section>
 
         {/* 11 · built with */}

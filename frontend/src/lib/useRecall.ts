@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Config, EventMsg, Snapshot } from "./types";
+import type { Config, EvalMsg, EventMsg, Snapshot } from "./types";
 
 const key = (e: EventMsg) => `${e.item}|${e.event}|${e.ts}`;
 
@@ -13,13 +13,15 @@ function merge(incoming: EventMsg[], prev: EventMsg[]): EventMsg[] {
   return [...map.values()].sort((a, b) => b.ts - a.ts).slice(0, 300);
 }
 
-export function useRecall(onEvent?: (e: EventMsg) => void) {
+export function useRecall(onEvent?: (e: EventMsg) => void, onEval?: (m: EvalMsg) => void) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<EventMsg[]>([]);
   const [connected, setConnected] = useState(false);
   const [serverSpeaking, setServerSpeaking] = useState(false); // the Mac is speaking an answer aloud
   const cb = useRef(onEvent);
   cb.current = onEvent;
+  const evalCb = useRef(onEval);
+  evalCb.current = onEval;
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -52,6 +54,7 @@ export function useRecall(onEvent?: (e: EventMsg) => void) {
           if (d.ready && !historyLoaded) loadHistory();
         }
         else if (d.type === "speaking") setServerSpeaking(!!d.on);
+        else if (d.type === "eval") evalCb.current?.(d as EvalMsg);
         else if (d.type === "event") {
           setEvents((prev) => merge([d as EventMsg], prev));
           cb.current?.(d as EventMsg);

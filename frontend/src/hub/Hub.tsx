@@ -11,8 +11,9 @@ import { doorToast, toastText, where } from "../lib/format";
 import { sinceReset } from "../lib/events";
 import { buildSlots } from "../lib/schedule";
 import { post, useConfig, useRecall } from "../lib/useRecall";
+import { EvalPill, type EvalActive } from "./EvalPill";
 import { useVoice, type StopReason } from "../lib/useVoice";
-import type { EventMsg, ItemName } from "../lib/types";
+import type { EvalData, EvalMsg, EventMsg, ItemName } from "../lib/types";
 import { AskCapsule, type VoiceState } from "./AskCapsule";
 import { JudgePanel, WherePanel } from "./Panels";
 import { Zones } from "./Zones";
@@ -48,6 +49,23 @@ export default function Hub() {
   const recording = useRef(false);   // the mic really started (not blocked, not still starting)
   const hlTimer = useRef(0);
 
+  // ── eval mode (E): rehearsal trials judged from the event log; invisible when off ──
+  const [evalMode, setEvalMode] = useState(false);
+  const [evalActive, setEvalActive] = useState<EvalActive | null>(null);
+  const [evalData, setEvalData] = useState<EvalData | null>(null);
+  const onEvalMsg = (m: EvalMsg) => {
+    if (m.kind === "started") setEvalActive({ trial: m.trial ?? "", label: m.label ?? "", deadline: m.deadline ?? null });
+    else if (m.kind === "finished") {
+      setEvalActive(null);
+      if (m.data) setEvalData(m.data);
+      if (m.toast) pushToast(m.toast);
+    } else {
+      setEvalActive(null);
+      setEvalData({});
+      pushToast("Eval cleared");
+    }
+  };
+
   const { snap, events: allEvents, serverSpeaking } = useRecall((e: EventMsg) => {
     if (e.item === "door") {
       // Mom's screen never shows door alerts; Judge view only gets a small toast
@@ -73,7 +91,7 @@ export default function Hub() {
       window.clearTimeout(hlTimer.current);
       hlTimer.current = window.setTimeout(() => setHighlight(null), 6000);
     }
-  });
+  }, onEvalMsg);
   const events = useMemo(() => sinceReset(allEvents), [allEvents]);
   const snapRef = useRef(snap);
   snapRef.current = snap;
@@ -93,6 +111,41 @@ export default function Hub() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // E toggles Eval mode. In it: 1 real dose · 2 fake · 3 second pickup · 4 where-question (then Y/N) · 5 door · R reset
+  const evalOn = useRef(false);
+  evalOn.current = evalMode;
+  useEffect(() => {
+    const TRIALS: Record<string, string> = { "1": "dose", "2": "fake", "3": "second", "4": "where", "5": "door" };
+    const fail = () => pushToast("Eval isn't available yet");
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "e") return void setEvalMode((m) => !m);
+      if (!evalOn.current) return;
+      if (TRIALS[k]) post("/api/eval/start", { type: TRIALS[k] }).catch(fail);
+      else if (k === "y" || k === "n") post("/api/eval/mark", { correct: k === "y" }).catch(fail);
+      else if (k === "r") post("/api/eval/reset").catch(fail);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // the latest results (for the "Tested" card), and the tool's state when Eval mode opens
+  useEffect(() => {
+    fetch("/api/eval").then((r) => (r.ok ? r.json() : null)).then((d) => d && setEvalData(d)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!evalMode) return;
+    fetch("/api/eval/status")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d) return;
+        setEvalData(d.data);
+        setEvalActive(d.active ? { trial: d.active, label: d.active, deadline: d.deadline ?? null } : null);
+      })
+      .catch(() => {});
+  }, [evalMode]);
 
   // answer card: speak it, auto-close after 12 s
   useEffect(() => {
@@ -282,7 +335,7 @@ export default function Hub() {
             exit={{ x: PANEL_W + GAP * 2 }}
             transition={spring.gentle}
           >
-            <JudgePanel snap={snap} events={events} onHow={openHow} voiceTimes={voiceTimes} />
+            <JudgePanel snap={snap} events={events} onHow={openHow} voiceTimes={voiceTimes} evalData={evalData} />
           </motion.div>
         )}
       </AnimatePresence>
@@ -384,6 +437,9 @@ export default function Hub() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Eval mode: nothing at all is drawn when it is off */}
+      {evalMode && <EvalPill active={evalActive} data={evalData} />}
 
       {/* tiny judge-view button */}
       <button

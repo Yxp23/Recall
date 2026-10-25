@@ -74,6 +74,14 @@ class EventStore:
             ).fetchone()
         return row["clip_path"] if row else None
 
+    def events_between(self, t0: float, t1: float) -> list[sqlite3.Row]:
+        """Events with t0 <= ts <= t1, oldest first (used by the eval tool)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT ts, item, event, detail FROM events WHERE ts >= ? AND ts <= ? ORDER BY ts, id",
+                (t0, t1),
+            ).fetchall()
+
     def recent_events(self, limit: int = 50) -> list[sqlite3.Row]:
         """Newest-first event rows."""
         with self._lock:
