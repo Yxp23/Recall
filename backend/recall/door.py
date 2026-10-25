@@ -24,9 +24,9 @@ DOOR_MODEL_PATH   = "models/yolov8n.pt"   # COCO; we only keep class 0 (person)
 DOOR_W, DOOR_H    = 640, 360
 DOOR_IMGSZ        = 320
 DOOR_DEVICE       = "cpu"                 # NEVER mps: only the kitchen pipeline uses the GPU (see _run)
-DETECT_EVERY      = 3                     # run the detector on every 3rd frame
+DETECT_EVERY      = 2                     # run the detector on every 2nd frame (≈4 per second: plenty for a line crossing)
 DETECT_CONF       = 0.35
-MAX_FPS           = 20.0                  # don't spin the CPU faster than this
+MAX_FPS           = 8.0                   # the door needs ~4 looks a second, not 20: this camera was costing the kitchen CPU
 TRACK_MAX_DIST_PX = 120                   # nearest-neighbour match radius
 TRACK_DROP_S      = 1.5                   # drop a track after this long unseen
 STAY_S            = 1.0                   # must stay on the new side this long
@@ -167,6 +167,8 @@ class DoorCamera:
 
     def _run_inner(self) -> None:
         from ultralytics import YOLO   # same package the kitchen uses; imported late so it's the thread's cost
+        import torch
+        torch.set_num_threads(2)       # the CPU detector must not grab every core from the kitchen pipeline
 
         # The detector runs on the CPU, always. Two threads driving MPS at once crashes torch
         # (NSInvalidArgumentException in the Metal compute pipeline), so the GPU belongs to the
@@ -253,12 +255,12 @@ class DoorCamera:
                     break
                 time.sleep(0.1)
                 continue
+            spare = 1.0 / MAX_FPS - (time.perf_counter() - t_loop)
+            if spare > 0:
+                time.sleep(spare)
             now = time.perf_counter()
             self.fps = 0.9 * self.fps + 0.1 / max(now - t_prev, 1e-6)
             t_prev = now
-            spare = 1.0 / MAX_FPS - (now - t_loop)
-            if spare > 0:
-                time.sleep(spare)
 
         if cap is not None:
             cap.release()
