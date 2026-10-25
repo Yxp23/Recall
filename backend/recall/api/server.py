@@ -26,6 +26,8 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from recall.cameras import door_camera_index
+from recall.door import DoorCamera
 from recall.pipeline import (
     CLIPS_DIR, LOGICAL_ITEMS, Pipeline, clip_url_for, event_message,
 )
@@ -73,6 +75,8 @@ class Runner:
         self.pipe: Optional[Pipeline] = None
         self.error: Optional[str] = "starting"
         self.talk_to_mom = True
+        self.door_alerts = True        # "Door alerts" setting: off = events are still logged, just not alerted
+        self.door: Optional[DoorCamera] = None
         self.frame_id = 0
         self.frames: dict[str, Optional[np.ndarray]] = {"annotated": None, "raw": None}
         self._stop = threading.Event()
@@ -84,7 +88,31 @@ class Runner:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.door is not None:
+            self.door.stop()
         self._thread.join(timeout=10)
+
+    def _start_door(self, pipe: Pipeline) -> None:
+        """Door camera = the Mac's built-in webcam, in its own thread. Failure never affects the kitchen."""
+        if os.environ.get("RECALL_DOOR", "1") == "0":
+            print("[door] disabled (RECALL_DOOR=0)")
+            return
+        try:
+            idx = door_camera_index()
+            if idx is None:
+                print("WARNING: no built-in Mac camera (FaceTime/MacBook) found; door features disabled")
+                return
+            if pipe.active_camera_index == idx:
+                print("WARNING: the kitchen is using the Mac's camera, so there is no second camera; "
+                      "door features disabled")
+                return
+            self.door = DoorCamera(idx, pipe.store,
+                                   on_event=lambda ev: self.hub.publish_threadsafe(ev.to_dict()),
+                                   alerts_enabled=lambda: self.door_alerts)
+            self.door.start()
+        except Exception:
+            traceback.print_exc()
+            print("WARNING: door camera failed to start; door features disabled")
 
     def _run(self) -> None:
         try:
@@ -93,6 +121,7 @@ class Runner:
             pipe.set_talk_to_mom(self.talk_to_mom)
             self.pipe = pipe
             self.error = None
+            self._start_door(pipe)
         except Exception as e:
             self.error = f"pipeline failed to start: {e}"
             traceback.print_exc()
@@ -118,18 +147,29 @@ class Runner:
         finally:
             pipe.close()
 
+    def _door_snapshot(self) -> dict:
+        if self.door is None:
+            return {"enabled": False, "fps": 0, "people": 0, "last_event": None, "error": None}
+        return self.door.snapshot()
+
     def snapshot(self) -> dict:
         if self.pipe is None:
             return {"type": "state", "ts": time.time(), "ready": False,
-                    "error": self.error, "talk_to_mom": self.talk_to_mom}
+                    "error": self.error, "talk_to_mom": self.talk_to_mom,
+                    "door_alerts": self.door_alerts, "door": self._door_snapshot()}
         snap = self.pipe.snapshot()
         snap["ready"] = True
         snap["error"] = self.error
+        snap["door_alerts"] = self.door_alerts
+        snap["door"] = self._door_snapshot()
         return snap
 
     def jpeg(self, kind: str) -> Optional[tuple[int, bytes]]:
         """Latest frame of `kind` as JPEG, encoded once per frame across all clients."""
-        fid, frame = self.frame_id, self.frames[kind]
+        if kind == "door":
+            fid, frame = (self.door.frame_id, self.door.annotated) if self.door else (0, None)
+        else:
+            fid, frame = self.frame_id, self.frames[kind]
         if frame is None:
             return None
         cached = self._jpeg.get(kind)
@@ -196,6 +236,12 @@ def stream_raw() -> StreamingResponse:
     return _stream("raw")
 
 
+@app.get("/stream/door.mjpg")
+def stream_door() -> StreamingResponse:
+    """Door camera with the door line, shaded outside, and person boxes with track ids."""
+    return _stream("door")
+
+
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
@@ -243,6 +289,7 @@ def api_events(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
         "ts":       r["ts"],
         "clip_url": _existing_clip_url(r["clip_path"]),
         "message":  event_message(r["item"], r["event"], r["zone"], r["detail"] or ""),
+        "silent":   (r["detail"] or "") == "silent",
     } for r in rows]
 
 
@@ -261,10 +308,25 @@ def api_config() -> dict:
             data = json.load(f)
     except (OSError, ValueError):
         data = {}
+    # the plain-English phrases the detector looks for (for the How it works page)
+    items = {k: v for k, v in data.items()
+             if isinstance(v, list) and v and all(isinstance(x, str) for x in v)}
     return {
         "schedule":  data.get("schedule") or _DEFAULT_SCHEDULE,
         "mom_phone": data.get("mom_phone", ""),
+        "items":     items,
     }
+
+
+@app.get("/api/eval")
+def api_eval() -> dict:
+    """Results for the "How it works" page: data/eval.json, or {} when it hasn't been made yet."""
+    try:
+        with open("data/eval.json") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 @app.get("/clips/{filename}")
@@ -296,15 +358,19 @@ def api_reset() -> dict:
 
 
 class SettingsBody(BaseModel):
-    talk_to_mom: bool
+    talk_to_mom: Optional[bool] = None
+    door_alerts: Optional[bool] = None
 
 
 @app.post("/api/settings")
 def api_settings(body: SettingsBody) -> dict:
-    runner.talk_to_mom = body.talk_to_mom
-    if runner.pipe is not None:
-        runner.pipe.set_talk_to_mom(body.talk_to_mom)
-    return {"talk_to_mom": runner.talk_to_mom}
+    if body.talk_to_mom is not None:
+        runner.talk_to_mom = body.talk_to_mom
+        if runner.pipe is not None:
+            runner.pipe.set_talk_to_mom(body.talk_to_mom)
+    if body.door_alerts is not None:
+        runner.door_alerts = body.door_alerts
+    return {"talk_to_mom": runner.talk_to_mom, "door_alerts": runner.door_alerts}
 
 
 # ── debug page (testing only) ──────────────────────────────────────────────────
@@ -384,6 +450,13 @@ def care_page() -> Response:
     return _index()
 
 
+@app.get("/how", include_in_schema=False)
+@app.get("/how/", include_in_schema=False)
+def how_page() -> Response:
+    """The "How it works" page (client-routed, same single-page app)."""
+    return _index()
+
+
 if (FRONTEND_DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
@@ -392,3 +465,24 @@ if (FRONTEND_DIST / "assets").is_dir():
 def favicon() -> Response:
     f = FRONTEND_DIST / "favicon.svg"
     return FileResponse(f) if f.is_file() else Response(status_code=404)
+
+
+# Paths that belong to the API, never to the single-page app.
+_NOT_SPA = ("api", "stream", "clips", "assets", "ws", "debug", "docs", "redoc", "openapi.json")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def spa_fallback(full_path: str) -> Response:
+    """Any other page path (/how, /care/anything, …) gets the app's index.html and the client routes it.
+
+    Registered last, so every real route above wins. API/stream/clip paths and requests for a
+    missing file (anything with an extension) stay a real 404 instead of an HTML page.
+    """
+    first = full_path.split("/", 1)[0]
+    if first in _NOT_SPA or "." in full_path.rsplit("/", 1)[-1]:
+        # a real file that lives in the build root (favicon, etc.)?
+        candidate = (FRONTEND_DIST / full_path).resolve()
+        if full_path and candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
+            return FileResponse(candidate)
+        raise HTTPException(404, "Not Found")
+    return _index()

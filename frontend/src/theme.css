@@ -161,6 +161,11 @@
 .t-display     { font-size: 96px; line-height: 100px; font-weight: 700; letter-spacing: -0.03em; }
 .t-display-2   { font-size: 56px; line-height: 60px; font-weight: 700; letter-spacing: -0.02em; }
 .t-display-3   { font-size: 32px; line-height: 38px; font-weight: 600; }
+/* product-page hero (How it works): scales with the screen */
+.t-hero        { font-size: clamp(40px, 8vw, 88px); line-height: 1.02; font-weight: 700; letter-spacing: -0.035em; }
+.t-section     { font-size: clamp(30px, 5vw, 56px); line-height: 1.06; font-weight: 700; letter-spacing: -0.03em; }
+.t-bignum-md   { font-size: clamp(44px, 6.4vw, 72px); line-height: 1; font-weight: 700; letter-spacing: -0.04em; }
+.t-bignum      { font-size: clamp(56px, 11vw, 120px); line-height: 1; font-weight: 700; letter-spacing: -0.04em; }
 
 .tabular { font-variant-numeric: tabular-nums; }
 }

@@ -19,7 +19,7 @@ import { CAREGIVER_PERSON } from "./copy";
 const RING_R = 42;
 const RING_C = 2 * Math.PI * RING_R;
 
-export function DoseSection({ slots }: { slots: Slot[] }) {
+export function DoseSection({ slots, extras }: { slots: Slot[]; extras: number[] }) {
   const total = slots.length || 3;
   const n = slots.filter((s) => s.status === "observed").length;
   const first = useFirstLoad("slots");
@@ -80,6 +80,14 @@ export function DoseSection({ slots }: { slots: Slot[] }) {
             />
           </Stagger>
         ))}
+        {extras.map((t) => (
+          <Row
+            key={t}
+            title={<span className="tabular">Extra · {clock(t)}</span>}
+            subtitle="More than 2 hours from a scheduled time"
+            value={<span className="text-label">Observed</span>}
+          />
+        ))}
       </Group>
     </section>
   );
@@ -88,6 +96,7 @@ export function DoseSection({ slots }: { slots: Slot[] }) {
 // ── alerts ───────────────────────────────────────────────────────────────────
 
 export function alertCopy(e: EventMsg) {
+  if (e.event === "left_house") return { title: "Left the house", sub: "Door camera" };
   return e.event === "repeat_reach"
     ? { title: "Reached for pills again", sub: "Recall reminded her" }
     : { title: "Possible second dose", sub: "Please check in" };

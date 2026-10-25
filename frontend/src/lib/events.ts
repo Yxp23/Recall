@@ -1,4 +1,4 @@
-import { ALERT_EVENTS } from "./config";
+import { isAlert } from "./config";
 import type { EventMsg } from "./types";
 
 /** Events worth showing in the caregiver feed (pickups / reappearances are noise). */
@@ -11,6 +11,8 @@ export const FEED_EVENTS = new Set([
   "dose_unclear",
   "repeat_reach",
   "possible_second_dose",
+  "left_house",
+  "came_back",
 ]);
 
 export const evKey = (e: EventMsg) => `${e.item}|${e.event}|${e.ts}`;
@@ -33,11 +35,12 @@ const GROUP_WINDOW_S = 60;
 
 /** Alerts (newest first) within 60 s of each other become one card. */
 export function groupAlerts(events: EventMsg[]): AlertGroup[] {
-  const alerts = events.filter((e) => ALERT_EVENTS.has(e.event)).sort((a, b) => b.ts - a.ts);
+  const alerts = events.filter(isAlert).sort((a, b) => b.ts - a.ts);
   const groups: AlertGroup[] = [];
   for (const a of alerts) {
-    const g = groups[groups.length - 1];
-    if (g && g.latest.ts - a.ts <= GROUP_WINDOW_S) {
+    // same 60 s rule; a door alert never merges into a medication one (different story)
+    const g = groups.find((x) => x.latest.item === a.item && x.latest.ts - a.ts <= GROUP_WINDOW_S);
+    if (g) {
       g.members.push(a);
       g.clipUrl ??= a.clip_url;
     } else {

@@ -17,6 +17,7 @@ import numpy as np
 CLIP_EVENTS = {
     "went_into", "went_worn", "went_in_hand", "placed", "picked_up",
     "dose_appears_taken", "dose_unclear", "repeat_reach",
+    "left_house", "came_back",   # door camera
 }
 _OUT_W, _OUT_H = 640, 360
 _PRE_S  = 6.0

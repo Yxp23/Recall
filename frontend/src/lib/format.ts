@@ -19,6 +19,15 @@ export function clock(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
 }
 
+/** "just now", "2 min ago", "3 h ago", else the clock time (for "Last activity …"). */
+export function ago(ts: number, now = Date.now() / 1000): string {
+  const s = Math.max(0, now - ts);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return clock(ts);
+}
+
 export function relative(ts: number, now = Date.now() / 1000): string {
   const s = Math.max(0, now - ts);
   if (s < 10) return "Just now";
@@ -106,6 +115,9 @@ export function toastText(e: EventMsg): string | null {
   return v ? `${itemLabel(e.item)} → ${v(e.zone)}` : null;
 }
 
+/** Hub, Judge view only: "Door: left_house". */
+export const doorToast = (e: EventMsg) => `Door: ${e.event}`;
+
 /** Plain-English sentence for the caregiver activity feed. */
 export function sentence(e: EventMsg): string {
   const name = itemLabel(e.item);
@@ -120,6 +132,10 @@ export function sentence(e: EventMsg): string {
       return "Possible second dose — please check";
     case "doses_reset":
       return "Demo reset";
+    case "left_house":
+      return "Left the house";
+    case "came_back":
+      return "Back home";
     case "picked_up":
       return `Picked up ${name.toLowerCase()}`;
     case "placed":

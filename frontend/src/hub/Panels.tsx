@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "motion/react";
-import { Check, Glasses, Pill, Wallet } from "lucide-react";
+import { ArrowUpRight, Check, Glasses, Pill, Wallet } from "lucide-react";
 import { Glass } from "../ui/Glass";
 import { Icon } from "../ui/Icon";
 import { spring } from "../ui/motion";
@@ -65,11 +65,18 @@ const MODELS = [
   ["MediaPipe Pose", "wrists, mouth, shoulders"],
 ];
 
-export function JudgePanel({ snap, events }: { snap: Snapshot | null; events: EventMsg[] }) {
+export function JudgePanel({ snap, events, onHow }: { snap: Snapshot | null; events: EventMsg[]; onHow: () => void }) {
   const d = snap?.dose;
   return (
     <Glass lens radius={28} pad={20} className="flex h-full w-full flex-col">
-      <h2 className="t-headline mb-3 text-label-2">How it works</h2>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h2 className="t-headline text-label-2">How it works</h2>
+        <button onClick={onHow} aria-label="Open the How it works page" className="shrink-0">
+          <Glass radius={28} className="t-footnote pressable flex items-center gap-1 px-3 py-1 font-medium">
+            Open <Icon as={ArrowUpRight} size="small" />
+          </Glass>
+        </button>
+      </div>
 
       <div className="mb-4 flex flex-col gap-1">
         {MODELS.map(([n, desc]) => (
@@ -79,7 +86,16 @@ export function JudgePanel({ snap, events }: { snap: Snapshot | null; events: Ev
             <span className="text-label-2">{desc}</span>
           </div>
         ))}
-        <div className="t-footnote tabular mt-1 text-label-2">{snap?.fps ?? 0} FPS · fully offline on this Mac</div>
+        <div className="t-subhead flex items-baseline gap-2">
+          <span className={`h-2 w-2 shrink-0 rounded-full ${snap?.door?.enabled ? "bg-green" : "bg-label-3"}`} />
+          <span className="font-semibold">Door camera</span>
+          <span className="tabular text-label-2">
+            {snap?.door?.enabled
+              ? `${snap.door.fps} FPS · ${snap.door.people} ${snap.door.people === 1 ? "person" : "people"}`
+              : "off (no second camera)"}
+          </span>
+        </div>
+        <div className="t-footnote tabular mt-1 text-label-2">{snap?.fps ?? 0} FPS kitchen · fully offline on this Mac</div>
       </div>
 
       <div className="mb-4 grid grid-cols-3 gap-2">

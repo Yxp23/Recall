@@ -179,6 +179,48 @@ html.lens .bubble[data-lifted="true"] {
   filter: brightness(0.82) saturate(1.05) sepia(0.14);
 }
 
+/* ── "How it works": dots flowing along the pipeline arrows ───────────────── */
+.flow-arrow {
+  position: relative;
+  flex: 1 1 32px;
+  min-width: 32px;
+  height: 2px;
+  background: var(--separator);
+  border-radius: 1px;
+}
+.flow-dot {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--label);
+  animation: flow-x 2.2s linear infinite;
+  animation-delay: var(--d, 0s);
+  opacity: 0;
+}
+@keyframes flow-x {
+  0%   { left: 0; opacity: 0; }
+  15%  { opacity: 1; }
+  85%  { opacity: 1; }
+  100% { left: calc(100% - 8px); opacity: 0; }
+}
+@media (max-width: 760px) {
+  .flow-arrow { width: 2px; height: 36px; flex: none; margin: 0 auto; }
+  .flow-dot { top: 0; left: 50%; margin: 0 0 0 -4px; animation-name: flow-y; }
+  @keyframes flow-y {
+    0%   { top: 0; opacity: 0; }
+    15%  { opacity: 1; }
+    85%  { opacity: 1; }
+    100% { top: calc(100% - 8px); opacity: 0; }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-dot { animation: none; opacity: 1; left: 50%; }
+}
+
 /* ── hub zone outlines: thin and soft; the most recently moved item's zone is highlighted ── */
 .zone {
   border: 1px solid var(--label-3);

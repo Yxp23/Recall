@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from recall.cameras import camera_names
 from recall.vision.hands   import HandFaceOverlay, draw_overlay
 from recall.events.tracker import ItemTracker, Observation, State
 from recall.events.store   import EventStore
@@ -98,7 +99,8 @@ WALLET_CLASSES: set[str] = {"wallet"} | {p for p, n in _item_display.items() if 
 
 TRACKED      = WALLET_CLASSES | {"glasses"} | GLASSES_CLASSES | MEDICATION_CLASSES
 # each detection becomes its own zone keyed by class name
-ZONE_ALIAS   = {"wicker basket": "basket", "storage basket": "basket", "laundry basket": "basket"}
+ZONE_ALIAS   = {"wicker basket": "basket", "storage basket": "basket", "laundry basket": "basket",
+                "bowl": "basket"}   # a bowl is a basket: one zone name, so never "went into the bowl"
 ZONE_ITEM    = {"basket", "tray", "bowl"} | set(ZONE_ALIAS)
 # largest detection of these collapses to one "counter" zone
 ZONE_SURFACE = {"table", "desk"}
@@ -139,6 +141,7 @@ CONF_ZONE_ITEM   = 0.15        # baskets / trays / bowls / shelves are often det
 ZONE_EMA         = 0.3        # smoothing factor for box coordinates
 ZONE_LINGER_S    = 15.0       # keep a zone this many seconds after it vanishes
 MIN_ZONE_AREA_PX = int(0.015 * 1280 * 720)  # 1.5% of frame — filters phantom small zones
+MIN_BOWL_TRAY_AREA_PX = int(0.03 * 1280 * 720)  # bowls/trays are often cups and plates: they need to be basket-sized (3%)
 
 TRACKED_COLORS = {
     "glasses":    (0,   255,   0),
@@ -171,22 +174,12 @@ def suppress(detections):
     return kept
 
 
-def _camera_names() -> list[str]:
-    """Names of the cameras macOS currently sees."""
-    try:
-        out = subprocess.run(["system_profiler", "SPCameraDataType", "-json"],
-                             capture_output=True, text=True, timeout=10).stdout
-        return [c.get("_name", "") for c in json.loads(out).get("SPCameraDataType", [])]
-    except Exception:
-        return []
-
-
 def pick_camera_index() -> int:
     """OpenCV index of the wanted camera, or RuntimeError if it isn't connected right now."""
     forced = os.environ.get("RECALL_CAMERA")
     if forced is not None:
         return int(forced)
-    names = _camera_names()
+    names = camera_names()
     if any(CAMERA_NAME.lower() in n.lower() for n in names):
         return 0   # OpenCV lists Continuity (iPhone) cameras before the built-in one
     raise RuntimeError(
@@ -235,6 +228,8 @@ class AutoZones:
 
         for _, x1, y1, x2, y2, cls_name in detections:
             box = (x1, y1, x2, y2)
+            if cls_name in ("bowl", "tray") and box_area(box) < MIN_BOWL_TRAY_AREA_PX:
+                continue   # too small to be a basket-like zone
             cls_name = ZONE_ALIAS.get(cls_name, cls_name)
             if cls_name in ZONE_ITEM or cls_name in ZONE_SINGLE:
                 # unique key per class+position so multiple baskets get separate zones
@@ -595,6 +590,10 @@ def event_message(item: str, event: str, zone: Optional[str] = None,
         return BANNER_SECOND_TEXT
     if event == "doses_reset":
         return "Doses reset"
+    if event == "left_house":
+        return "Left the house"
+    if event == "came_back":
+        return "Back home"
     text = f"{item.capitalize()} {_EVENT_TEXT.get(event, event.replace('_', ' '))}"
     if zone:
         text += f" ({zone})"
@@ -623,6 +622,7 @@ class PipelineEvent:
             "ts":       self.ts,
             "clip_url": clip_url_for(self.clip_path),
             "message":  event_message(self.item, self.event, self.zone, self.detail),
+            "silent":   self.detail == "silent",   # door events logged while "Door alerts" is off
         }
 
 
@@ -639,6 +639,7 @@ class Pipeline:
     def __init__(self, camera_index: Optional[int] = None, hud: bool = True) -> None:
         self.camera_index = camera_index   # None = pick by name (see pick_camera_index)
         self.cap: Optional[cv2.VideoCapture] = None
+        self.active_camera_index: Optional[int] = None   # OpenCV index actually open (door camera avoids it)
         self.camera_error: Optional[str] = None
         self._last_cam_try = 0.0
         self._read_fails = 0
@@ -715,6 +716,7 @@ class Pipeline:
             if ok:
                 brightest = max(brightest, float(f.mean()))
         self.cap = cap
+        self.active_camera_index = idx
         self.camera_error = None
         self._read_fails = 0
         print(f"Camera {idx} opened ({w0}x{h0}). Device: {self.device}.")

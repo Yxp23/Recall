@@ -25,6 +25,15 @@ export interface Snapshot {
   last_alert?: { event: string; message: string; ts: number } | null;
   fps?: number;
   talk_to_mom: boolean;
+  door_alerts?: boolean;
+  /** the door camera (the Mac's webcam); enabled=false when there is no second camera */
+  door?: {
+    enabled: boolean;
+    fps: number;
+    people: number;
+    last_event: { event: string; ts: number } | null;
+    error: string | null;
+  };
   /** dose state machine, for the judge view */
   dose?: {
     state: string;
@@ -45,6 +54,8 @@ export interface EventMsg {
   ts: number;
   clip_url: string | null;
   message: string;
+  /** door events logged while "Door alerts" was off: shown as activity, never as an alert */
+  silent?: boolean;
 }
 
 export interface ScheduleSlot {
@@ -55,6 +66,8 @@ export interface ScheduleSlot {
 export interface Config {
   schedule: ScheduleSlot[];
   mom_phone: string;
+  /** item name → the plain-English phrases the detector is told to look for (data/items.json) */
+  items?: Record<string, string[]>;
 }
 
 export const ITEMS = ["glasses", "wallet", "medication"] as const;

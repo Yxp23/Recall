@@ -1,6 +1,6 @@
 import type { ScheduleSlot } from "./types";
 
-/** observed · unsure (a dose_unclear happened in the slot) · none (past, nothing seen) · upcoming */
+/** observed · unsure (a dose_unclear happened near the slot) · none (past, nothing seen) · upcoming */
 export type SlotStatus = "observed" | "unsure" | "none" | "upcoming";
 export interface Slot {
   label: string;
@@ -23,33 +23,65 @@ const pretty = (hhmm: string) => {
   return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
 };
 
-/** How long after the scheduled time we still say "Upcoming" rather than "Not sure". */
+/** How long after the scheduled time we still say "Upcoming" rather than "No observation". */
 const GRACE_MIN = 90;
+/** A dose further than this from every slot is an extra, never credited to a slot. */
+export const SLOT_REACH_MIN = 120;
+
+/** Distance (minutes, around the clock) between two times of day. */
+const gap = (a: number, b: number) => {
+  const d = Math.abs(a - b);
+  return Math.min(d, 24 * 60 - d);
+};
+
+/** Index of the nearest slot within SLOT_REACH_MIN of this time, or -1. */
+function slotFor(mins: number[], ts: number): number {
+  const m = todMinutes(ts);
+  let best = -1;
+  let bd = Infinity;
+  mins.forEach((sm, i) => {
+    const d = gap(sm, m);
+    if (d <= SLOT_REACH_MIN && d < bd) {
+      bd = d;
+      best = i;
+    }
+  });
+  return best;
+}
+
+export interface SlotResult {
+  slots: Slot[];
+  /** observed doses more than 2 h from any slot (listed as "Extra · 12:36 AM", not credited) */
+  extras: number[];
+}
 
 /**
- * Assign today's observed doses to schedule slots. Each slot owns the window
- * from the midpoint with the previous slot to the midpoint with the next.
+ * Credit today's observed doses to the nearest slot within 2 h; anything further away is an extra.
  */
 export function buildSlots(
   schedule: ScheduleSlot[],
   doseTimes: number[],
   unclearTimes: number[],
   now = new Date(),
-): Slot[] {
+): SlotResult {
   const mins = schedule.map((s) => minutesOf(s.time));
   const nowMin = now.getHours() * 60 + now.getMinutes();
-  return schedule.map((s, i) => {
-    const start = i === 0 ? 0 : (mins[i - 1] + mins[i]) / 2;
-    const end = i === mins.length - 1 ? 24 * 60 : (mins[i] + mins[i + 1]) / 2;
-    const inWin = (t: number) => {
-      const m = todMinutes(t);
-      return m >= start && m < end;
-    };
-    const dose = doseTimes.filter(inWin).sort((a, b) => a - b)[0];
+  const credited = new Map<number, number[]>();
+  const extras: number[] = [];
+  for (const t of [...doseTimes].sort((a, b) => a - b)) {
+    const i = slotFor(mins, t);
+    if (i < 0) extras.push(t);
+    else credited.set(i, [...(credited.get(i) ?? []), t]);
+  }
+  const unclearSlots = new Set(unclearTimes.map((t) => slotFor(mins, t)).filter((i) => i >= 0));
+
+  const slots = schedule.map((s, i): Slot => {
     const base = { label: s.label, time: pretty(s.time) };
-    if (dose !== undefined) return { ...base, status: "observed", at: dose } as Slot;
-    if (unclearTimes.some(inWin)) return { ...base, status: "unsure" } as Slot;
-    if (nowMin < mins[i] + GRACE_MIN) return { ...base, status: "upcoming" } as Slot;
-    return { ...base, status: "none" } as Slot;
+    const dose = credited.get(i)?.[0];
+    if (dose !== undefined) return { ...base, status: "observed", at: dose };
+    if (unclearSlots.has(i)) return { ...base, status: "unsure" };
+    if (nowMin < mins[i] + GRACE_MIN) return { ...base, status: "upcoming" };
+    return { ...base, status: "none" };
   });
+  return { slots, extras };
 }

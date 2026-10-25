@@ -47,14 +47,16 @@ export function AlertSheet({ group, earlierDose, phone, handled, onHandled, onCl
                 </div>
               )}
 
-              <div className="mb-4">
-                <Group>
-                  <Row
-                    title="Earlier dose"
-                    value={earlierDose ? <span className="tabular">{clock(earlierDose)} · appears taken</span> : "None observed"}
-                  />
-                </Group>
-              </div>
+              {g.latest.item === "medication" && (
+                <div className="mb-4">
+                  <Group>
+                    <Row
+                      title="Earlier dose"
+                      value={earlierDose ? <span className="tabular">{clock(earlierDose)} · appears taken</span> : "None observed"}
+                    />
+                  </Group>
+                </div>
+              )}
 
               <div className="flex gap-3">
                 {phone ? (

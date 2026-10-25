@@ -7,7 +7,7 @@ import { Icon } from "../ui/Icon";
 import { dur, spring } from "../ui/motion";
 import { speak } from "../lib/audio";
 import { ALERT_EVENTS, CAREGIVER, DOSE_EVENTS } from "../lib/config";
-import { toastText, where } from "../lib/format";
+import { doorToast, toastText, where } from "../lib/format";
 import { sinceReset } from "../lib/events";
 import { buildSlots } from "../lib/schedule";
 import { post, useConfig, useRecall } from "../lib/useRecall";
@@ -43,6 +43,15 @@ export default function Hub() {
   const hlTimer = useRef(0);
 
   const { snap, events: allEvents } = useRecall((e: EventMsg) => {
+    if (e.item === "door") {
+      // Mom's screen never shows door alerts; Judge view only gets a small toast
+      if (judge) {
+        const id = Date.now() + Math.random();
+        setToasts((t) => [...t.slice(-2), { id, text: doorToast(e) }]);
+        window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
+      }
+      return;
+    }
     if (ALERT_EVENTS.has(e.event)) {
       setAlertId(Date.now());
       return;
@@ -110,10 +119,13 @@ export default function Hub() {
   const slots = useMemo(() => {
     const start = new Date().setHours(0, 0, 0, 0) / 1000;
     const unclear = events.filter((e) => e.event === "dose_unclear" && e.ts >= start).map((e) => e.ts);
-    return buildSlots(cfg.schedule, snap?.dose_times ?? [], unclear);
+    return buildSlots(cfg.schedule, snap?.dose_times ?? [], unclear).slots;
   }, [cfg.schedule, snap?.dose_times, events]);
 
   const frame = snap?.frame ?? [1280, 720];
+  const openHow = () => {
+    window.location.href = "/how?back=/&theme=dark";   // Esc on that page comes back here
+  };
 
   return (
     <div data-theme="dark" className="fixed inset-0 overflow-hidden bg-card text-label">
@@ -134,6 +146,18 @@ export default function Hub() {
           className={`h-full w-full ${judge ? "object-contain" : "hub-video object-cover"}`}
         />
         {!judge && <Zones zones={snap?.zones ?? []} frame={frame as [number, number]} highlight={highlight} />}
+        {/* Judge view: door camera picture-in-picture (door line, shaded outside, person boxes) */}
+        {judge && snap?.door?.enabled && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.92 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={spring.bouncy}
+            className="absolute bottom-4 left-4 z-10 w-[240px] overflow-hidden rounded-r14 bg-black shadow-[var(--glass-shadow)]"
+          >
+            <img src="/stream/door.mjpg" alt="Door camera" className="block aspect-video w-full object-cover" />
+            <span className="t-caption absolute left-2 top-2 rounded-r10 bg-scrim px-2 py-1 text-label">Door</span>
+          </motion.div>
+        )}
       </motion.div>
 
       {/* toasts: centered over the camera area */}
@@ -178,7 +202,7 @@ export default function Hub() {
             exit={{ x: PANEL_W + GAP * 2 }}
             transition={spring.gentle}
           >
-            <JudgePanel snap={snap} events={events} />
+            <JudgePanel snap={snap} events={events} onHow={openHow} />
           </motion.div>
         )}
       </AnimatePresence>
@@ -282,7 +306,7 @@ export default function Hub() {
       <button
         onClick={() => setJudge((j) => !j)}
         aria-label="Toggle judge view (J)"
-        className="pressable fixed bottom-4 left-4 z-40 grid h-8 w-8 place-items-center rounded-full bg-fill text-label-2"
+        className="pressable fixed left-4 top-4 z-40 grid h-8 w-8 place-items-center rounded-full bg-fill text-label-2"
       >
         <Icon as={Eye} size="small" />
       </button>

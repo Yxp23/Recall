@@ -13,7 +13,7 @@ import { Toggle } from "../ui/Toggle";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { cardIn, dur, screen, spring } from "../ui/motion";
 import { chime, unlockAudio } from "../lib/audio";
-import { ALERT_EVENTS } from "../lib/config";
+import { ALERT_EVENTS, isAlert } from "../lib/config";
 import { collapseFeed, evKey, FEED_EVENTS, groupAlerts, sinceReset, type AlertGroup } from "../lib/events";
 import { clock, sentence } from "../lib/format";
 import { buildSlots } from "../lib/schedule";
@@ -22,6 +22,7 @@ import { post, useConfig, useRecall } from "../lib/useRecall";
 import type { EventMsg } from "../lib/types";
 import { AlertSheet } from "./AlertSheet";
 import { AlertList, DoseSection, FeedList, ThingsSection, alertCopy } from "./parts";
+import { SummaryCard, type SummaryState } from "./Summary";
 import { CAREGIVER_PERSON, DISCLAIMER } from "./copy";
 
 type Tab = "home" | "alerts" | "activity" | "settings";
@@ -59,11 +60,12 @@ export default function Care() {
   const [handled, setHandled] = useState<Set<string>>(loadHandled);
   const [compact, setCompact] = useState(false);
   const [talk, setTalk] = useState(true);
+  const [doorAlerts, setDoorAlerts] = useState(true);
   const [confirmReset, setConfirmReset] = useState(false);
   const [appearance, setAppearance] = useState<Appearance>(getAppearance);
 
   const { snap, events: allEvents } = useRecall((e) => {
-    if (ALERT_EVENTS.has(e.event)) {
+    if (isAlert(e)) {
       chime();
       setBanner(e);
     }
@@ -74,6 +76,9 @@ export default function Care() {
   useEffect(() => {
     if (snap) setTalk(snap.talk_to_mom);
   }, [snap?.talk_to_mom]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (snap?.door_alerts !== undefined) setDoorAlerts(snap.door_alerts);
+  }, [snap?.door_alerts]);
 
   useEffect(() => {
     if (!banner) return;
@@ -91,7 +96,8 @@ export default function Care() {
   const { scrollY } = useScroll();
   const titleOpacity = useTransform(scrollY, [0, 48], [1, 0]);
   const titleY = useTransform(scrollY, [0, 48], [0, -8]);
-  const titleBlur = useTransform(scrollY, [0, 48], ["blur(0px)", "blur(8px)"]);
+  // "none" at rest: even filter: blur(0px) makes the browser rasterize the title on its own layer (soft text)
+  const titleBlur = useTransform(scrollY, (y) => (y < 1 ? "none" : `blur(${Math.min(8, (y / 48) * 8).toFixed(1)}px)`));
   const barOpacity = useTransform(scrollY, [24, 64], [0, 1]);
   const lastY = useRef(0);
   useMotionValueEvent(scrollY, "change", (y) => {
@@ -105,12 +111,35 @@ export default function Care() {
   }, [tab]);
 
   const groups = useMemo(() => groupAlerts(events), [events]);
+  // the latest door event decides the status: "Home" or "Left at 9:42 PM"
+  const away = useMemo(() => {
+    const last = events.find((e) => e.item === "door"); // events are newest first
+    return last && last.event === "left_house" ? last : null;
+  }, [events]);
   const isHandled = (g: AlertGroup) => g.members.every((m) => handled.has(evKey(m)));
-  const slots = useMemo(() => {
+  const { slots, extras } = useMemo(() => {
     const start = new Date().setHours(0, 0, 0, 0) / 1000;
     const unclear = events.filter((e) => e.event === "dose_unclear" && e.ts >= start).map((e) => e.ts);
     return buildSlots(cfg.schedule, snap?.dose_times ?? [], unclear);
   }, [cfg.schedule, snap?.dose_times, events]);
+
+  // "Last activity 2 min ago" needs a clock that ticks
+  const [nowSec, setNowSec] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    const t = window.setInterval(() => setNowSec(Date.now() / 1000), 30000);
+    return () => {
+      window.clearInterval(t);
+    };
+  }, []);
+
+  const unhandledGroups = groups.filter((g) => !isHandled(g));
+  const summary: SummaryState = useMemo(() => {
+    if (away) return { kind: "left", at: away.ts };
+    const open = unhandledGroups[0];
+    if (open) return { kind: "alert", key: open.key, detail: `${alertCopy(open.latest).title} · ${clock(open.latest.ts)}`, ts: open.latest.ts };
+    return { kind: "ok", last: events[0]?.ts ?? null };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [away, groups, handled, events]);
 
   const earlierDose = (g: AlertGroup | null) =>
     g ? (events.find((e) => e.event === "dose_appears_taken" && e.ts < g.members[g.members.length - 1].ts)?.ts ?? null) : null;
@@ -132,11 +161,11 @@ export default function Care() {
       if (!FEED_EVENTS.has(e.event)) return false;
       switch (filter) {
         case "items":
-          return e.item !== "medication";
+          return e.item !== "medication" && e.item !== "door";
         case "medication":
           return e.item === "medication" && !ALERT_EVENTS.has(e.event);
         case "alerts":
-          return ALERT_EVENTS.has(e.event);
+          return isAlert(e);
         default:
           return true;
       }
@@ -147,6 +176,10 @@ export default function Care() {
   const setTalkRemote = (v: boolean) => {
     setTalk(v);
     post("/api/settings", { talk_to_mom: v }).catch(() => setTalk(!v));
+  };
+  const setDoorAlertsRemote = (v: boolean) => {
+    setDoorAlerts(v);
+    post("/api/settings", { door_alerts: v }).catch(() => setDoorAlerts(!v));
   };
   const doReset = async () => {
     if (!confirmReset) return setConfirmReset(true);
@@ -200,7 +233,8 @@ export default function Care() {
             {tab === "home" && (
               <>
                 <div className="t-footnote mt-1 flex items-center gap-2 text-label-2">
-                  <span className="h-2 w-2 rounded-full bg-green" /> Home
+                  <span className={`h-2 w-2 rounded-full ${away ? "bg-orange" : "bg-green"}`} />
+                  {away ? `Left at ${clock(away.ts)}` : "Home"}
                 </div>
                 <p className="t-subhead text-label-2">A little peace of mind.</p>
               </>
@@ -213,7 +247,8 @@ export default function Care() {
                 <ErrorBoundary area="home tab" resetKey={tab}>
                 {tab === "home" && (
                   <>
-                    <DoseSection slots={slots} />
+                    <SummaryCard state={summary} name={CAREGIVER_PERSON.name} phone={cfg.mom_phone} now={nowSec} />
+                    <DoseSection slots={slots} extras={extras} />
                     {unhandled.length > 0 && (
                       <section>
                         <SectionHeader>Needs attention</SectionHeader>
@@ -290,8 +325,14 @@ export default function Care() {
                       <SectionHeader>Reminders</SectionHeader>
                       <Group>
                         <Row title={`Talk to ${CAREGIVER_PERSON.name}`} trailing={<Toggle checked={talk} onChange={setTalkRemote} label={`Talk to ${CAREGIVER_PERSON.name}`} />} />
+                        <Row title="Door alerts" trailing={<Toggle checked={doorAlerts} onChange={setDoorAlertsRemote} label="Door alerts" />} />
                       </Group>
-                      <p className="t-footnote px-4 pt-2 text-label-2">Speak reminders out loud at home. Alerts still appear here.</p>
+                      <p className="t-footnote px-4 pt-2 text-label-2">Speak reminders out loud at home. With door alerts off, comings and goings are still logged under Activity.</p>
+                    </section>
+                    <section>
+                      <Group>
+                        <Row title="How Recall works" chevron onClick={() => { window.location.href = "/how?back=/care"; }} />
+                      </Group>
                     </section>
                     <section>
                       <Group>

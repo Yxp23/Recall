@@ -9,18 +9,21 @@ import "./styles.css";
 // Hub at "/", caregiver at "/care" — FastAPI serves the same index.html for both.
 const Hub = lazy(() => import("./hub/Hub"));
 const Care = lazy(() => import("./care/Care"));
+const How = lazy(() => import("./how/HowItWorks"));
 
-const isCare = location.pathname.replace(/\/+$/, "").endsWith("/care");
-// The hub is always dark (kitchen display); the caregiver app follows the saved appearance.
-if (isCare) applyAppearance(getAppearance());
+const path = location.pathname.replace(/\/+$/, "");
+const isCare = path.endsWith("/care");
+const isHow = path.endsWith("/how");
+// The hub is always dark (kitchen display); the caregiver app and the How page follow the saved appearance.
+if (isCare || isHow) applyAppearance(getAppearance());
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     {/* reducedMotion="user": prefers-reduced-motion → transforms become simple fades */}
     <MotionConfig reducedMotion="user">
       <LensDefs />
-      <ErrorBoundary area={isCare ? "caregiver app" : "hub"}>
-        <Suspense fallback={null}>{isCare ? <Care /> : <Hub />}</Suspense>
+      <ErrorBoundary area={isCare ? "caregiver app" : isHow ? "how it works" : "hub"}>
+        <Suspense fallback={null}>{isCare ? <Care /> : isHow ? <How /> : <Hub />}</Suspense>
       </ErrorBoundary>
     </MotionConfig>
   </StrictMode>,
