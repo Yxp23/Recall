@@ -18,7 +18,8 @@ from recall.events.tracker import State
 
 DOSE_WINDOW        = 4 * 3600  # prior dose within this triggers repeat_reach
 MOUTH_DIST_THRESH  = 0.70      # hand point must be < this × shoulder_width from mouth (seated pill motions reach 0.6-0.65)
-PICKUP_TIMEOUT_S   = 10.0      # seconds from pickup before giving up
+PICKUP_TIMEOUT_S   = 12.0      # seconds from pickup before giving up
+PUT_DOWN_CONFIRM_S = 1.5       # "put down" = tracker says ON with no hand near it, for this long (a bottle held still is also "ON")
 MOUTH_DWELL_S      = 0.4       # seconds hand must stay near mouth
 MOUTH_GAP_S        = 0.4       # a hand-tracking flicker this short doesn't restart the dwell
 MOUTH_VISIBLE_WINDOW_S = 1.5   # mouth must have been visible this recently at the reach (a hand/bottle at the mouth hides it)
@@ -124,6 +125,7 @@ class DoseMonitor:
         self._hand_ep: Optional[dict] = None   # {"max": px moved so far, "dead": gate failed}
         self._miss_checked = False             # evaluated this disappearance already
         self._miss_since: Optional[float] = None  # ts it was last seen, while a pickup is pending
+        self._put_down_since: Optional[float] = None   # when the bottle last looked set down (no hand near, ON)
         self._pickup_active = False            # a pickup was confirmed and the bottle hasn't been set down since
         self._confirm_ts = float("-inf")       # when that pickup was confirmed
         self._lock_logged = False              # already printed "waiting for set-down" for this disappearance
@@ -292,11 +294,18 @@ class DoseMonitor:
                                    events=events, ts=ts, ts_wall=ts_wall)
                 return events
 
-            # medication reappeared on surface — explicitly put back down
-            if med_state == State.ON:
-                self._emit_unclear("put down before mouth", save_clip=False,
-                                   events=events, ts=ts, ts_wall=ts_wall)
-                return events
+            # put back down before reaching the mouth. Not just "tracker says ON": a bottle held still in a
+            # hand also becomes ON, and that ended 6 of 7 recent attempts. It must be ON with no hand near it
+            # for PUT_DOWN_CONFIRM_S.
+            if med_state == State.ON and not med_hand_near:
+                if self._put_down_since is None:
+                    self._put_down_since = ts
+                elif ts - self._put_down_since >= PUT_DOWN_CONFIRM_S:
+                    self._emit_unclear("put down before mouth", save_clip=False,
+                                       events=events, ts=ts, ts_wall=ts_wall)
+                    return events
+            else:
+                self._put_down_since = None
 
             # check hand-to-mouth proximity
             if self._closest_ratio is not None and self._closest_ratio < MOUTH_DIST_THRESH:
@@ -491,6 +500,7 @@ class DoseMonitor:
         self._pickup_ts = ts
         self._pickup_reason = reason
         self._mouth_near_since = None
+        self._put_down_since = None
         self._w_frames = self._w_mouth_vis = self._w_hand_pts = 0
         self._best_ratio = None
         print(f"[dose] pickup confirmed ({reason})")
