@@ -11,8 +11,9 @@ import { doorToast, toastText, where } from "../lib/format";
 import { sinceReset } from "../lib/events";
 import { buildSlots } from "../lib/schedule";
 import { post, useConfig, useRecall } from "../lib/useRecall";
+import { useVoice, type StopReason } from "../lib/useVoice";
 import type { EventMsg, ItemName } from "../lib/types";
-import { AskCapsule } from "./AskCapsule";
+import { AskCapsule, type VoiceState } from "./AskCapsule";
 import { JudgePanel, WherePanel } from "./Panels";
 import { Zones } from "./Zones";
 import { GAP, PANEL_W, STAGE_RADIUS, STAGE_RIGHT_JUDGE } from "./layout";
@@ -25,7 +26,9 @@ const QUESTION: Record<ItemName, string> = {
 
 interface AnswerState {
   id: number;
-  item: ItemName;
+  /** a tapped item, or a spoken question (answered by the server, which also speaks it) */
+  item: ItemName | "voice";
+  transcript?: string;
   headline: string;
   detail: string;
   clipUrl: string | null;
@@ -37,12 +40,15 @@ export default function Hub() {
   const [alertId, setAlertId] = useState<number | null>(null);
   const [highlight, setHighlight] = useState<string | null>(null);
   const [judge, setJudge] = useState(false);
-  const [asking, setAsking] = useState(false);
   const [answer, setAnswer] = useState<AnswerState | null>(null);
   const [speaking, setSpeaking] = useState(false);
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceTimes, setVoiceTimes] = useState<{ ms: number; server: number | null } | null>(null);
+  const voice = useVoice();
+  const recording = useRef(false);   // the mic really started (not blocked, not still starting)
   const hlTimer = useRef(0);
 
-  const { snap, events: allEvents } = useRecall((e: EventMsg) => {
+  const { snap, events: allEvents, serverSpeaking } = useRecall((e: EventMsg) => {
     if (e.item === "door") {
       // Mom's screen never shows door alerts; Judge view only gets a small toast
       if (judge) {
@@ -92,7 +98,8 @@ export default function Hub() {
   useEffect(() => {
     if (!answer) return;
     let cancel = () => {};
-    if (snapRef.current?.talk_to_mom !== false) {
+    // spoken answers are read aloud by the server (macOS "say"); tapped ones by this browser
+    if (answer.item !== "voice" && snapRef.current?.talk_to_mom !== false) {
       setSpeaking(true);
       cancel = speak(`${answer.headline} ${answer.detail}`, () => setSpeaking(false));
     }
@@ -104,8 +111,81 @@ export default function Hub() {
     };
   }, [answer?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const pushToast = (text: string) => {
+    const id = Date.now() + Math.random();
+    setToasts((t) => [...t.slice(-2), { id, text }]);
+    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
+  };
+
+  // ── tap to ask: one tap listens, it stops by itself after 1.2 s of silence ─
+  const log = (msg: string) => {
+    console.log(`[voice] ${msg}`);
+    fetch("/api/voice/log", {   // mirror it in the server terminal
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ msg }),
+      keepalive: true,
+    }).catch(() => {});
+  };
+  const unavailable = () => pushToast("Voice isn't available — tap a button instead");
+
+  const finish = async (reason: StopReason) => {
+    if (!recording.current) return;
+    recording.current = false;
+    const t0 = performance.now(); // release → answer
+    const rec = await voice.stop(reason);
+    if (!rec) {
+      setVoiceState("idle");
+      return;
+    }
+    log(`stop (${reason}) after ${(rec.ms / 1000).toFixed(1)} s, peak ${rec.peak.toFixed(3)}, room ${rec.floor.toFixed(4)}`);
+    if (!rec.speech || rec.ms < 500) {
+      setVoiceState("idle");
+      pushToast("I didn't hear anything. Tap to try again.");
+      return;
+    }
+    setVoiceState("thinking");
+    try {
+      log(`sent ${(rec.blob.size / 1024).toFixed(0)} KB`);
+      const r = await fetch("/api/voice", {
+        method: "POST",
+        headers: { "Content-Type": rec.blob.type || "application/octet-stream" },
+        body: rec.blob,
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      const d = (await r.json()) as { transcript: string; answer: string; clip_url: string | null; timing?: { total_ms?: number } };
+      const took = performance.now() - t0;
+      log(`answer in ${(took / 1000).toFixed(1)} s`);
+      setVoiceTimes({ ms: took, server: d.timing?.total_ms ?? null });
+      setAnswer({ id: Date.now(), item: "voice", transcript: d.transcript, headline: d.answer, detail: "", clipUrl: d.clip_url });
+    } catch {
+      unavailable();
+    } finally {
+      setVoiceState("idle");
+    }
+  };
+
+  const onTapAsk = async () => {
+    if (voiceState === "thinking" || voiceState === "starting") return;
+    if (voiceState === "listening") return void finish("tap"); // a second tap stops
+    const v = snapRef.current?.voice;
+    if (v && !v.ready) return unavailable(); // model still loading, or voice is off
+    window.speechSynthesis?.cancel();
+    setAnswer(null);
+    setVoiceState("starting"); // "Getting ready…": don't say "Listening" until the mic is really recording
+    const ok = await voice.start((reason) => void finish(reason));
+    if (!ok) {
+      setVoiceState("idle");
+      unavailable(); // mic blocked / not a secure origin
+      return;
+    }
+    recording.current = true;
+    log("start");
+    fetch("/api/voice/prepare", { method: "POST" }).catch(() => {}); // warm up the spoken answers while she talks
+    setVoiceState("listening");
+  };
+
   const ask = async (item: ItemName) => {
-    setAsking(false);
     let clipUrl: string | null = null;
     try {
       clipUrl = (await post<{ clip_url: string | null }>("/api/ask", { item })).clip_url;
@@ -202,7 +282,7 @@ export default function Hub() {
             exit={{ x: PANEL_W + GAP * 2 }}
             transition={spring.gentle}
           >
-            <JudgePanel snap={snap} events={events} onHow={openHow} />
+            <JudgePanel snap={snap} events={events} onHow={openHow} voiceTimes={voiceTimes} />
           </motion.div>
         )}
       </AnimatePresence>
@@ -227,10 +307,11 @@ export default function Hub() {
       </AnimatePresence>
 
       <AskCapsule
-        open={asking}
-        onToggle={() => setAsking((a) => !a)}
         onPick={ask}
         area={{ left: judge ? GAP : 0, right: judge ? STAGE_RIGHT_JUDGE : 0 }}
+        voiceState={voiceState}
+        wave={voice.wave}
+        onTap={onTapAsk}
       />
 
       {/* answer card */}
@@ -248,7 +329,7 @@ export default function Hub() {
               style={{ gridTemplateColumns: answer.clipUrl ? "1.1fr 1fr" : "1fr" }}
             >
               <AnimatePresence>
-                {speaking && (
+                {(speaking || serverSpeaking) && (
                   <motion.div
                     initial={{ opacity: 0, scale: 0.8 }}
                     animate={{ opacity: 1, scale: 1 }}
@@ -263,9 +344,11 @@ export default function Hub() {
                 )}
               </AnimatePresence>
               <div className="flex flex-col justify-center">
-                <div className="t-title3 text-label-2">{QUESTION[answer.item]}</div>
-                <div className="t-display mt-3">{answer.headline}</div>
-                <div className="t-display-3 mt-5 text-label-2">{answer.detail}</div>
+                <div className="t-title3 text-label-2">
+                  {answer.item === "voice" ? (answer.transcript ? `“${answer.transcript}”` : "I didn’t hear anything") : QUESTION[answer.item]}
+                </div>
+                <div className={`${answer.item === "voice" ? "t-display-2" : "t-display"} mt-3`}>{answer.headline}</div>
+                {answer.detail && <div className="t-display-3 mt-5 text-label-2">{answer.detail}</div>}
               </div>
               {answer.clipUrl && (
                 <ClipVideo

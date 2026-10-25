@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { MotionConfig } from "motion/react";
 import { LensDefs } from "./ui/LensDefs";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
+import { IntroShell } from "./ui/Intro";
 import { applyAppearance, getAppearance } from "./lib/theme";
 import "./styles.css";
 
@@ -23,7 +24,14 @@ createRoot(document.getElementById("root")!).render(
     <MotionConfig reducedMotion="user">
       <LensDefs />
       <ErrorBoundary area={isCare ? "caregiver app" : isHow ? "how it works" : "hub"}>
-        <Suspense fallback={null}>{isCare ? <Care /> : isHow ? <How /> : <Hub />}</Suspense>
+        <Suspense fallback={null}>
+          {isHow ? (
+            <How />
+          ) : (
+            // "/" and "/care" get the intro on every load; the page itself mounts underneath right away
+            <IntroShell dark={!isCare}>{isCare ? <Care /> : <Hub />}</IntroShell>
+          )}
+        </Suspense>
       </ErrorBoundary>
     </MotionConfig>
   </StrictMode>,

@@ -65,7 +65,12 @@ const MODELS = [
   ["MediaPipe Pose", "wrists, mouth, shoulders"],
 ];
 
-export function JudgePanel({ snap, events, onHow }: { snap: Snapshot | null; events: EventMsg[]; onHow: () => void }) {
+export function JudgePanel({ snap, events, onHow, voiceTimes }: {
+  snap: Snapshot | null;
+  events: EventMsg[];
+  onHow: () => void;
+  voiceTimes: { ms: number; server: number | null } | null;
+}) {
   const d = snap?.dose;
   return (
     <Glass lens radius={28} pad={20} className="flex h-full w-full flex-col">
@@ -93,6 +98,19 @@ export function JudgePanel({ snap, events, onHow }: { snap: Snapshot | null; eve
             {snap?.door?.enabled
               ? `${snap.door.fps} FPS · ${snap.door.people} ${snap.door.people === 1 ? "person" : "people"}`
               : "off (no second camera)"}
+          </span>
+        </div>
+        <div className="t-subhead flex items-baseline gap-2">
+          <span className={`h-2 w-2 shrink-0 rounded-full ${snap?.voice?.ready ? "bg-green" : "bg-label-3"}`} />
+          <span className="font-semibold">Voice</span>
+          <span className="tabular text-label-2">
+            {snap?.voice?.ready
+              ? voiceTimes
+                ? `whisper small · ${(voiceTimes.ms / 1000).toFixed(1)} s round trip${voiceTimes.server ? ` (server ${(voiceTimes.server / 1000).toFixed(1)} s)` : ""}`
+                : "whisper small · ready"
+              : snap?.voice?.error
+                ? "off (taps still work)"
+                : "loading…"}
           </span>
         </div>
         <div className="t-footnote tabular mt-1 text-label-2">{snap?.fps ?? 0} FPS kitchen · fully offline on this Mac</div>

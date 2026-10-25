@@ -26,6 +26,8 @@ export interface Snapshot {
   fps?: number;
   talk_to_mom: boolean;
   door_alerts?: boolean;
+  /** push-to-talk: the speech model loads in the background after the server starts */
+  voice?: { ready: boolean; error: string | null };
   /** the door camera (the Mac's webcam); enabled=false when there is no second camera */
   door?: {
     enabled: boolean;

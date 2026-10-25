@@ -17,6 +17,7 @@ export function useRecall(onEvent?: (e: EventMsg) => void) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<EventMsg[]>([]);
   const [connected, setConnected] = useState(false);
+  const [serverSpeaking, setServerSpeaking] = useState(false); // the Mac is speaking an answer aloud
   const cb = useRef(onEvent);
   cb.current = onEvent;
 
@@ -50,6 +51,7 @@ export function useRecall(onEvent?: (e: EventMsg) => void) {
           setSnap(d as Snapshot);
           if (d.ready && !historyLoaded) loadHistory();
         }
+        else if (d.type === "speaking") setServerSpeaking(!!d.on);
         else if (d.type === "event") {
           setEvents((prev) => merge([d as EventMsg], prev));
           cb.current?.(d as EventMsg);
@@ -68,7 +70,7 @@ export function useRecall(onEvent?: (e: EventMsg) => void) {
     };
   }, []);
 
-  return { snap, events, connected };
+  return { snap, events, connected, serverSpeaking };
 }
 
 const FALLBACK_CONFIG: Config = {

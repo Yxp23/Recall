@@ -20,17 +20,19 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from recall.audio import TTS, play_voice_file
 from recall.cameras import door_camera_index
 from recall.door import DoorCamera
 from recall.pipeline import (
     CLIPS_DIR, LOGICAL_ITEMS, Pipeline, clip_url_for, event_message,
 )
+from recall.voice import NOT_READY, NOT_UNDERSTOOD, VoiceEngine, answer_question, candidate_answers
 
 ITEMS_JSON   = "data/items.json"
 FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
@@ -108,7 +110,8 @@ class Runner:
                 return
             self.door = DoorCamera(idx, pipe.store,
                                    on_event=lambda ev: self.hub.publish_threadsafe(ev.to_dict()),
-                                   alerts_enabled=lambda: self.door_alerts)
+                                   alerts_enabled=lambda: self.door_alerts,
+                                   on_left=self._door_reminder)
             self.door.start()
         except Exception:
             traceback.print_exc()
@@ -147,6 +150,11 @@ class Runner:
         finally:
             pipe.close()
 
+    def _door_reminder(self) -> None:
+        """Mom hears data/voice/door.m4a when she leaves (only if the file exists and Talk to Mom is on)."""
+        if self.talk_to_mom and play_voice_file("data/voice/door.m4a", "door reminder"):
+            print("[door] reminder played")
+
     def _door_snapshot(self) -> dict:
         if self.door is None:
             return {"enabled": False, "fps": 0, "people": 0, "last_event": None, "error": None}
@@ -156,12 +164,14 @@ class Runner:
         if self.pipe is None:
             return {"type": "state", "ts": time.time(), "ready": False,
                     "error": self.error, "talk_to_mom": self.talk_to_mom,
-                    "door_alerts": self.door_alerts, "door": self._door_snapshot()}
+                    "door_alerts": self.door_alerts, "door": self._door_snapshot(),
+                    "voice": voice.status()}
         snap = self.pipe.snapshot()
         snap["ready"] = True
         snap["error"] = self.error
         snap["door_alerts"] = self.door_alerts
         snap["door"] = self._door_snapshot()
+        snap["voice"] = voice.status()
         return snap
 
     def jpeg(self, kind: str) -> Optional[tuple[int, bytes]]:
@@ -184,12 +194,22 @@ class Runner:
 
 hub    = Hub()
 runner = Runner(hub)
+tts    = TTS()
+voice  = VoiceEngine()   # loads whisper in a background thread; failure never blocks the server
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     hub.loop = asyncio.get_running_loop()
     runner.start()
+    if os.environ.get("RECALL_VOICE", "1") == "0":
+        print("[voice] disabled (RECALL_VOICE=0)")
+        voice.error = "voice is switched off"
+    else:
+        try:
+            voice.start()
+        except Exception as e:   # voice is optional: the tap buttons keep working
+            print(f"WARNING: voice failed to start: {e}")
     yield
     await asyncio.get_running_loop().run_in_executor(None, runner.stop)
 
@@ -350,6 +370,73 @@ def api_ask(body: AskBody) -> dict:
         raise HTTPException(400, f"item must be one of {LOGICAL_ITEMS}")
     answer, clip_path = _pipe().ask(body.item)
     return {"answer": answer, "clip_url": _existing_clip_url(clip_path)}
+
+
+MAX_VOICE_BYTES = 6 * 1024 * 1024
+
+
+def _handle_voice(body: bytes) -> dict:
+    """Decode → transcribe → answer (blocking work, run in a thread)."""
+    pipe = _pipe()
+    t0 = time.perf_counter()
+    tts.cancel = True   # stop speculative renders: whisper needs the CPU now
+    try:
+        audio = voice.decode(body)
+    except Exception as e:
+        print(f"[voice] could not decode the audio: {e}")
+        return {"transcript": "", "answer": NOT_UNDERSTOOD, "clip_url": None, "timing": {}}
+    t1 = time.perf_counter()
+    text = voice.transcribe(audio)
+    t2 = time.perf_counter()
+    answer, clip_path = answer_question(pipe, text) if text else (NOT_UNDERSTOOD, None)
+    print(f"[voice] heard {text!r} → {answer!r}  (decode {1000*(t1-t0):.0f} ms, whisper {1000*(t2-t1):.0f} ms)")
+    print(f"[voice] answer in {time.perf_counter() - t0:.1f} s (server side)")
+    if pipe.monitor.audio_enabled:   # Talk to Mom
+        tts.speak(answer, on_state=lambda on: hub.publish_threadsafe({"type": "speaking", "on": on}))
+    return {
+        "transcript": text,
+        "answer": answer,
+        "clip_url": _existing_clip_url(clip_path),
+        "timing": {"decode_ms": round(1000 * (t1 - t0)), "whisper_ms": round(1000 * (t2 - t1)),
+                   "total_ms": round(1000 * (time.perf_counter() - t0))},
+    }
+
+
+class VoiceLogBody(BaseModel):
+    msg: str
+
+
+@app.post("/api/voice/log")
+def api_voice_log(body: VoiceLogBody) -> dict:
+    """The Hub mirrors its start / stop / sent lines here so they also show in the server terminal."""
+    print(f"[voice] (hub) {body.msg[:200]}")
+    return {"ok": True}
+
+
+@app.post("/api/voice/prepare")
+def api_voice_prepare() -> dict:
+    """She just tapped to ask: render the likely answers to audio now, while she is still speaking."""
+    pipe = runner.pipe
+    if pipe is None or not pipe.monitor.audio_enabled:
+        return {"ok": False}
+    try:
+        tts.prerender(candidate_answers(pipe))
+    except Exception as e:
+        print(f"[voice] prepare failed: {e}")
+        return {"ok": False}
+    return {"ok": True}
+
+
+@app.post("/api/voice")
+async def api_voice(request: Request) -> dict:
+    """Push-to-talk: the body is the raw browser recording (webm/opus or mp4)."""
+    if not voice.ready:
+        raise HTTPException(503, voice.error or NOT_READY)
+    body = await request.body()
+    if not body or len(body) > MAX_VOICE_BYTES:
+        raise HTTPException(400, "no audio, or too long")
+    print(f"[voice] received {len(body) / 1024:.0f} KB")
+    return await asyncio.get_running_loop().run_in_executor(None, _handle_voice, body)
 
 
 @app.post("/api/reset")

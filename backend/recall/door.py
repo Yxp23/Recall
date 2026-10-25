@@ -91,11 +91,13 @@ class CentroidTracker:
 class DoorCamera:
     def __init__(self, camera_index: int, store: EventStore,
                  on_event: Callable[[PipelineEvent], None],
-                 alerts_enabled: Callable[[], bool]) -> None:
+                 alerts_enabled: Callable[[], bool],
+                 on_left: Optional[Callable[[], None]] = None) -> None:
         self.camera_index = camera_index
         self._store = store
         self._on_event = on_event
         self._alerts_enabled = alerts_enabled
+        self._on_left = on_left   # spoken reminder for Mom when she leaves (data/voice/door.m4a)
 
         self.running = False                       # camera open and streaming
         self.error: Optional[str] = None
@@ -280,3 +282,8 @@ class DoorCamera:
         self.last_event = {"event": event, "ts": ts_wall}
         print(f"[door] {event} (track #{t.id}, {detail})" + (" [clip]" if clip_path else ""))
         self._on_event(PipelineEvent("door", event, None, ts_wall, clip_path, detail))
+        if event == "left_house" and alert and self._on_left is not None:
+            try:
+                self._on_left()
+            except Exception:
+                traceback.print_exc()
