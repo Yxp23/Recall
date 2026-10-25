@@ -102,7 +102,7 @@ export function JudgePanel({ snap, events }: { snap: Snapshot | null; events: Ev
         <div className="flex justify-between">
           <span className="text-label-2">Hand-to-mouth</span>
           <span className="font-semibold">
-            {d?.closest_ratio != null ? d.closest_ratio.toFixed(2) : "N/A"} / {d ? d.threshold.toFixed(2) : "0.50"}
+            {d?.closest_ratio != null ? d.closest_ratio.toFixed(2) : "N/A"} / {d ? d.threshold.toFixed(2) : "0.70"}
           </span>
         </div>
         <div className="flex justify-between">

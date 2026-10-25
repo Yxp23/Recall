@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -16,14 +17,15 @@ if TYPE_CHECKING:
 from recall.events.tracker import State
 
 DOSE_WINDOW        = 4 * 3600  # prior dose within this triggers repeat_reach
-MOUTH_DIST_THRESH  = 0.5       # hand point must be < this × shoulder_width from mouth
+MOUTH_DIST_THRESH  = 0.70      # hand point must be < this × shoulder_width from mouth (seated pill motions reach 0.6-0.65)
 PICKUP_TIMEOUT_S   = 10.0      # seconds from pickup before giving up
-MOUTH_DWELL_S      = 0.3       # seconds hand must stay near mouth
+MOUTH_DWELL_S      = 0.4       # seconds hand must stay near mouth
 MOUTH_GAP_S        = 0.4       # a hand-tracking flicker this short doesn't restart the dwell
-MOUTH_VISIBLE_WINDOW_S = 0.5   # mouth must have been visible this recently at the reach
+MOUTH_VISIBLE_WINDOW_S = 1.5   # mouth must have been visible this recently at the reach (a hand/bottle at the mouth hides it)
 UNCLEAR_MIN_HELD_S = 3.0       # an unclear pickup held/out of view this long counts for repeat_reach
-MIN_ON_BEFORE_PICKUP_S = 2.0   # medication must have been tracked ON this long before a pickup
-ON_TO_PICKUP_MAX_S = 3.0       # …and that ON period must have ended this recently (no gap = "from nowhere")
+REST_WINDOW_S      = 3.0       # "resting": the medication was seen at one spot within this window…
+REST_MIN_SEEN_S    = 1.5       # …for at least this long in total…
+REST_MAX_GAP_S     = 0.7       # …bridging detection flicker up to this long
 MIN_SINCE_REF_S    = 2.0       # a pickup is valid only this long after the last placed/ON event or pickup
 DOSE_COOLDOWN_S    = 30.0      # no second dose_appears_taken this long after one (pickups still fire)
 VOICE_DELAY_S      = 0.8       # voice starts this long after the chime starts
@@ -32,7 +34,7 @@ HAND_NEAR_PICKUP_S = 1.0       # a hand box must have overlapped the medication 
 PICKUP_MOVE_PX     = 60        # IN_HAND pickup: box center must move this far from its resting spot
 MISSING_CONFIRM_S  = 1.5       # disappeared-with-hand pickup: still missing after this long
 OCCLUDED_MAX_S     = 2.0       # reappearing at the resting spot within this = it was only occluded
-REST_RADIUS_PX     = 40        # "at its resting spot"
+REST_RADIUS_PX     = 40        # "the same spot" / "at its resting spot"
 
 BANNER_TEXT = "You may have already taken this one. Please check with Sarah."
 BANNER_SECOND_TEXT = "This may be a second dose. Sarah has been notified."
@@ -109,9 +111,8 @@ class DoseMonitor:
         self._best_ratio: Optional[float] = None
         self._is_repeat: bool = False        # current pickup raised repeat_reach
         self._last_ref_ts: Optional[float] = None  # last placed/ON event or valid pickup
-        self._on_since: Optional[float] = None     # ts the medication became ON (None = not ON now)
-        self._last_on_dur: float = 0.0             # length of the most recent ON period
-        self._last_on_end_ts: float = float("-inf")
+        # recent detections: (ts, center, a hand box overlapped the bottle on that frame)
+        self._pos_hist: deque[tuple[float, tuple[float, float], bool]] = deque()
         self._cooldown_until: float = 0.0
 
         # pickup confirmation: resting position, in-hand episode, disappeared-with-hand candidate
@@ -123,6 +124,9 @@ class DoseMonitor:
         self._hand_ep: Optional[dict] = None   # {"max": px moved so far, "dead": gate failed}
         self._miss_checked = False             # evaluated this disappearance already
         self._miss_since: Optional[float] = None  # ts it was last seen, while a pickup is pending
+        self._pickup_active = False            # a pickup was confirmed and the bottle hasn't been set down since
+        self._confirm_ts = float("-inf")       # when that pickup was confirmed
+        self._lock_logged = False              # already printed "waiting for set-down" for this disappearance
 
         # debug / display
         self._last_event: str = ""
@@ -161,22 +165,16 @@ class DoseMonitor:
 
         # ── medication position + hand contact ────────────────────────────────
         center = _center(med_box) if (med_detected and med_box) else None
+        hand_on = bool(med_detected and med_box and any(_overlap(med_box, hb) for hb in hand_boxes))
         if med_detected:
             self._last_med_detected_ts = ts
             self._last_det_state = med_state
-            if med_box and any(_overlap(med_box, hb) for hb in hand_boxes):
+            if hand_on:
                 self._hand_overlap_ts = ts
-            if center and med_state == State.ON and not med_hand_near:
-                self._rest_center = center   # resting position; frozen while a hand is near
-
-        # ── how long has the medication been sitting ON? ──────────────────────
-        if med_state == State.ON:
-            if self._on_since is None:
-                self._on_since = ts
-        elif self._on_since is not None:
-            self._last_on_dur = ts - self._on_since
-            self._last_on_end_ts = ts
-            self._on_since = None
+        if center:
+            self._pos_hist.append((ts, center, hand_on))
+        while self._pos_hist and ts - self._pos_hist[0][0] > 2 * REST_WINDOW_S:
+            self._pos_hist.popleft()
 
         # ── tracker events are the source of truth for pickups ────────────────
         for name in med_events:
@@ -193,13 +191,40 @@ class DoseMonitor:
         )
 
         # ── IDLE: look for a CONFIRMED pickup ─────────────────────────────────
-        if self._state == _IDLE:
+        # ── after a confirmed pickup, wait for the bottle to be set down ──────
+        if self._pickup_active:
+            placed = med_state == State.ON or any(
+                n in ("placed", "reappeared", "taken_off") for n in med_events)
+            # a bottle held still in a hand is not set down: only hand-free frames count as resting
+            seen, _ = self._rest_check(ts, since=self._confirm_ts, hand_free=True)
+            if placed:
+                self._pickup_active = False
+                print("[dose] set-down detected (tracker: placed/ON); ready for the next pickup")
+            elif seen >= REST_MIN_SEEN_S:
+                self._pickup_active = False
+                print(f"[dose] set-down detected (resting {seen:.1f}s at one spot, no hand on it); ready for the next pickup")
+            else:
+                reason = (f"no set-down since the last pickup: tracker not ON, resting "
+                          f"{seen:.1f}s of {REST_MIN_SEEN_S:.1f}s without a hand on it")
+                if med_state == State.IN_HAND and prev_state != State.IN_HAND:
+                    print(f"[dose] ignored: waiting for set-down ({reason}; picked up again)")
+                if med_detected:
+                    self._lock_logged = False
+                elif not self._lock_logged and self._last_med_detected_ts - self._hand_overlap_ts <= HAND_NEAR_PICKUP_S:
+                    self._lock_logged = True
+                    print(f"[dose] ignored: waiting for set-down ({reason}; vanished with a hand)")
+
+        if self._state == _IDLE and not self._pickup_active:
             # (a) detected IN_HAND and its center moved > PICKUP_MOVE_PX from the resting spot
             if med_state == State.IN_HAND and prev_state != State.IN_HAND:
-                gate = self._pickup_gate(ts)
-                self._hand_ep = {"max": 0.0, "dead": gate is not None}
-                if gate:
-                    print(f"[dose] ignored: in hand but {gate}")
+                if self._miss_since is not None:
+                    # this pickup is already pending (it vanished with a hand): resting was checked then
+                    self._hand_ep = {"max": 0.0, "dead": False}
+                else:
+                    gate = self._pickup_gate(ts)
+                    self._hand_ep = {"max": 0.0, "dead": gate is not None}
+                    if gate:
+                        print(f"[dose] ignored: in hand but {gate}")
             if self._hand_ep is not None:
                 if med_state == State.IN_HAND:
                     if center and self._rest_center:
@@ -215,10 +240,10 @@ class DoseMonitor:
             # (b) vanished with a hand box on it and still missing after MISSING_CONFIRM_S
             if self._state == _IDLE:
                 if not med_detected:
-                    if not self._miss_checked:
+                    if not self._miss_checked and self._miss_since is None:
                         self._miss_checked = True
                         hand_on_it = self._last_med_detected_ts - self._hand_overlap_ts <= HAND_NEAR_PICKUP_S
-                        if self._last_det_state == State.ON and hand_on_it:
+                        if self._last_det_state != State.IN_HAND and hand_on_it:
                             gate = self._pickup_gate(ts)
                             if gate:
                                 print(f"[dose] ignored: vanished with hand but {gate}")
@@ -231,11 +256,17 @@ class DoseMonitor:
                     if self._miss_since is not None and center and self._rest_center:
                         d = _dist(center, self._rest_center)
                         gone = ts - self._miss_since
-                        self._miss_since = None
-                        if d <= REST_RADIUS_PX and gone <= OCCLUDED_MAX_S:
-                            print("[dose] ignored: occluded, reappeared at rest spot")
+                        if d > PICKUP_MOVE_PX:
+                            # it came back far from where it rested: it was moved = a real pickup
+                            self._confirm_pickup(f"reappeared {d:.0f}px away", ts, ts_wall, events)
+                        elif d <= REST_RADIUS_PX:
+                            self._miss_since = None
+                            if gone <= OCCLUDED_MAX_S:
+                                print("[dose] ignored: occluded, reappeared at rest spot")
+                            else:
+                                print(f"[dose] ignored: reappeared at rest spot after {gone:.1f}s")
                         else:
-                            print(f"[dose] ignored: reappeared {d:.0f}px from rest spot after {gone:.1f}s")
+                            self._miss_since = ts   # 40-60 px: undecided, keep waiting
 
         # ── AWAITING_MOUTH: track face + proximity ────────────────────────────
         elif self._state == _AWAITING_MOUTH:
@@ -409,14 +440,34 @@ class DoseMonitor:
         self._unclear_count = len(urows)
         self._unclears = [r[0] for r in urows if "[held>=3s]" in (r[1] or "")]
 
+    def _rest_check(self, ts: float, since: Optional[float] = None,
+                    hand_free: bool = False) -> tuple[float, Optional[tuple[float, float]]]:
+        """Longest time the medication was seen at ONE spot (within REST_RADIUS_PX) in the last
+        REST_WINDOW_S, bridging detection gaps up to REST_MAX_GAP_S. Returns (seconds, spot)."""
+        pts = [(t, c) for t, c, h in self._pos_hist
+               if ts - t <= REST_WINDOW_S and (since is None or t >= since) and not (hand_free and h)]
+        best_seen, best_spot = 0.0, None
+        for _, anchor in pts:
+            inside = [(t, c) for t, c in pts if _dist(c, anchor) <= REST_RADIUS_PX]
+            seen = sum(t1 - t0 for (t0, _), (t1, _) in zip(inside, inside[1:])
+                       if t1 - t0 <= REST_MAX_GAP_S)
+            if best_spot is None or seen > best_seen:
+                best_seen = seen
+                best_spot = (sum(c[0] for _, c in inside) / len(inside),
+                             sum(c[1] for _, c in inside) / len(inside))
+        return best_seen, best_spot
+
     def _pickup_gate(self, ts: float) -> Optional[str]:
-        """Why a pickup can't count right now, or None if it can."""
+        """Why a pickup can't count right now, or None if it can. Always prints the resting check."""
+        seen, spot = self._rest_check(ts)
+        ok = spot is not None and seen >= REST_MIN_SEEN_S
+        print(f"[dose] resting check: seen {seen:.1f}s of last {REST_WINDOW_S:.0f}s at rest spot "
+              f"({'ok' if ok else f'need {REST_MIN_SEEN_S:.1f}s'})")
         if self._last_ref_ts is not None and ts - self._last_ref_ts < MIN_SINCE_REF_S:
             return f"only {ts - self._last_ref_ts:.1f}s since the last pickup/placed"
-        if not self._was_on_before(ts):
-            return f"medication was not ON for {MIN_ON_BEFORE_PICKUP_S:.0f}s before"
-        if self._rest_center is None:
-            return "no resting position known"
+        if not ok:
+            return f"medication was not resting (seen {seen:.1f}s of last {REST_WINDOW_S:.0f}s at one spot)"
+        self._rest_center = spot   # used by the moved / occluded checks
         return None
 
     def _confirm_pickup(self, reason: str, ts: float, ts_wall: float,
@@ -424,6 +475,9 @@ class DoseMonitor:
         """A pickup is confirmed: start waiting for the mouth, and raise repeat_reach if due."""
         self._hand_ep = None
         self._miss_since = None
+        self._pickup_active = True   # until the bottle is set down (placed/ON, or resting 1.5s), pickups are ignored, loudly
+        self._confirm_ts = ts
+        self._lock_logged = False
         self._last_ref_ts = ts
         self._is_repeat = False
         self._state = _AWAITING_MOUTH
@@ -443,13 +497,6 @@ class DoseMonitor:
                            detail="prior dose within window", save_clip=True)
             events.append(ev)
             self._last_event = ev.event
-
-    def _was_on_before(self, ts: float) -> bool:
-        """Medication sat ON for ≥ MIN_ON_BEFORE_PICKUP_S, ending just now (or still ON)."""
-        if self._on_since is not None:
-            return ts - self._on_since >= MIN_ON_BEFORE_PICKUP_S
-        return (self._last_on_dur >= MIN_ON_BEFORE_PICKUP_S
-                and ts - self._last_on_end_ts <= ON_TO_PICKUP_MAX_S)
 
     def _prior_activity_in_window(self, ts_wall: float) -> bool:
         """A dose, or an unclear pickup held ≥ UNCLEAR_MIN_HELD_S, inside DOSE_WINDOW."""

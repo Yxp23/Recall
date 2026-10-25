@@ -183,6 +183,25 @@ export default function Hub() {
         )}
       </AnimatePresence>
 
+      {/* shown while the iPhone camera is missing (the server keeps looking; it never falls back to the Mac) */}
+      <AnimatePresence>
+        {snap?.error && snap.error !== "starting" && (
+          <motion.div
+            key="cam-error"
+            initial={{ opacity: 0, scale: 0.92 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0 }}
+            transition={spring.bouncy}
+            className="pointer-events-none fixed inset-0 z-20 grid place-items-center px-8"
+          >
+            <Glass radius={28} pad={24} className="max-w-[560px] text-center">
+              <div className="t-title3">Waiting for the camera</div>
+              <p className="t-subhead mt-2 text-label-2">{snap.error}</p>
+            </Glass>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <AskCapsule
         open={asking}
         onToggle={() => setAsking((a) => !a)}

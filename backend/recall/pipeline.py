@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,11 +27,15 @@ from recall.events.answers import where_is, state_label
 from recall.events.clips   import RollingBuffer, ClipSaver, CLIP_EVENTS
 from recall.events.dose    import DoseMonitor, BANNER_TEXT, BANNER_SECOND_TEXT
 
-# OpenCV's device order on this Mac (verified by grabbing frames, not the same as the
-# system list): 0 = iPhone (Continuity Camera, 1920x1080), 1 = FaceTime HD Camera.
-# The order can change if the iPhone isn't connected when the app starts, so check
-# the "Camera N opened" line at startup. Override: RECALL_CAMERA=1 ./backend/scripts/serve.sh
-CAMERA_INDEX    = int(os.environ.get("RECALL_CAMERA", "0"))
+# Camera choice. OpenCV numbers cameras by position, and Continuity Camera (the iPhone) is only
+# in the list while the phone is connected: with it index 0 is the iPhone, without it index 0
+# silently becomes the Mac's FaceTime camera. So never trust an index: ask macOS which cameras
+# exist, use index 0 only when the iPhone is really there, and otherwise WAIT instead of
+# falling back to the Mac camera.
+#   RECALL_CAMERA=N        force an OpenCV index (e.g. RECALL_CAMERA=0 with no iPhone = Mac camera)
+#   RECALL_CAMERA_NAME=... match another camera name (default "iPhone")
+CAMERA_NAME     = os.environ.get("RECALL_CAMERA_NAME", "iPhone")
+CAMERA_RETRY_S  = 3.0     # how often to look for the camera again while it's missing
 MODEL_PATH      = "models/yolov8l-worldv2.pt"
 HAND_MODEL_PATH = "models/hand_landmarker.task"
 FACE_MODEL_PATH = "models/face_landmarker.task"
@@ -164,6 +169,30 @@ def suppress(detections):
         if all(iou(cand[1:5], k[1:5]) <= IOU_SUPPRESS for k in kept):
             kept.append(cand)
     return kept
+
+
+def _camera_names() -> list[str]:
+    """Names of the cameras macOS currently sees."""
+    try:
+        out = subprocess.run(["system_profiler", "SPCameraDataType", "-json"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return [c.get("_name", "") for c in json.loads(out).get("SPCameraDataType", [])]
+    except Exception:
+        return []
+
+
+def pick_camera_index() -> int:
+    """OpenCV index of the wanted camera, or RuntimeError if it isn't connected right now."""
+    forced = os.environ.get("RECALL_CAMERA")
+    if forced is not None:
+        return int(forced)
+    names = _camera_names()
+    if any(CAMERA_NAME.lower() in n.lower() for n in names):
+        return 0   # OpenCV lists Continuity (iPhone) cameras before the built-in one
+    raise RuntimeError(
+        f"No '{CAMERA_NAME}' camera right now (macOS sees: {', '.join(names) or 'none'}). Unlock the "
+        "iPhone, keep it near the Mac, and check Continuity Camera is on. "
+        "(RECALL_CAMERA=0 forces the Mac camera.)")
 
 
 def box_area(box):
@@ -379,7 +408,7 @@ def _build_observation(item: str, last_detections: list, held: set[str],
             is_worn = True
         # fallback: glasses center (not bottom) is inside top 35% of a "person" box
         if not is_worn:
-            gcx = bcx
+            gcx = (best_box[0] + best_box[2]) // 2
             gcy = (best_box[1] + best_box[3]) // 2   # true vertical center for face check
             for _, px1, py1, px2, py2, pcls in last_detections:
                 if pcls != "person":
@@ -607,8 +636,12 @@ class FrameResult:
 class Pipeline:
     """Owns camera, models, trackers, dose monitor, clips and store."""
 
-    def __init__(self, camera_index: int = CAMERA_INDEX, hud: bool = True) -> None:
-        self.camera_index = camera_index
+    def __init__(self, camera_index: Optional[int] = None, hud: bool = True) -> None:
+        self.camera_index = camera_index   # None = pick by name (see pick_camera_index)
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.camera_error: Optional[str] = None
+        self._last_cam_try = 0.0
+        self._read_fails = 0
         # hud=True (the OpenCV preview): status panel, FPS, dose-debug box, answer/banner/flash
         # text. hud=False (the web UI): the annotated frame carries only detection boxes with
         # labels, zone outlines and the hand/pose skeleton; the UI draws everything else itself.
@@ -630,8 +663,9 @@ class Pipeline:
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
-    def start(self) -> None:
-        """Load models and open the camera. Raises RuntimeError if no camera."""
+    def start(self, require_camera: bool = True) -> None:
+        """Load models and open the camera. With require_camera=False a missing camera isn't
+        fatal: step() keeps looking for it and returns None until it appears."""
         self.model = YOLO(MODEL_PATH)
         self.model.set_classes(CLASSES)
 
@@ -642,14 +676,6 @@ class Pipeline:
         except Exception:
             self.device = "cpu"
 
-        self.cap = cv2.VideoCapture(self.camera_index)
-        if not self.cap.isOpened():
-            raise RuntimeError(
-                f"Could not open camera index {self.camera_index}. Check System Settings > "
-                "Privacy & Security > Camera, or try a different index.")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
         self.auto_zones = AutoZones()
         self.trackers   = {item: ItemTracker(item) for item in LOGICAL_ITEMS}
         self.store      = EventStore()
@@ -658,27 +684,49 @@ class Pipeline:
         self.clip_saver = ClipSaver(out_dir=CLIPS_DIR)
         self.overlay    = HandFaceOverlay(HAND_MODEL_PATH, FACE_MODEL_PATH, POSE_MODEL_PATH)
 
+        print(f"Doses loaded from DB: {len(self.monitor._doses)}")
+        try:
+            self._open_camera()
+        except RuntimeError as e:
+            if require_camera:
+                raise
+            self.camera_error = str(e)
+            print(f"WARNING: {e}")
+
+    def _open_camera(self) -> None:
+        """Open the wanted camera (never silently the wrong one). Raises RuntimeError."""
+        idx = self.camera_index if self.camera_index is not None else pick_camera_index()
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError(f"Could not open camera index {idx}. Check System Settings > "
+                               "Privacy & Security > Camera.")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
         # Continuity Camera can open fine yet stream pure black (phone locked, lens covered,
         # session not started). Say so loudly instead of silently running on black.
-        w0 = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h0 = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         brightest = 0.0
         t0 = time.time()
         while time.time() - t0 < 4.0 and brightest < 2.0:
-            ok, f = self.cap.read()
+            ok, f = cap.read()
             if ok:
                 brightest = max(brightest, float(f.mean()))
-        print(f"Camera {self.camera_index} opened ({w0}x{h0}). Device: {self.device}.")
+        self.cap = cap
+        self.camera_error = None
+        self._read_fails = 0
+        print(f"Camera {idx} opened ({w0}x{h0}). Device: {self.device}.")
         if brightest < 2.0:
-            print(f"WARNING: camera {self.camera_index} is streaming black frames. If this is the iPhone: "
-                  "unlock it, keep it upright with the rear camera uncovered, and make sure no other app "
-                  "is using it. (RECALL_CAMERA=1 uses the Mac's camera.)")
-        print(f"Doses loaded from DB: {len(self.monitor._doses)}")
+            print(f"WARNING: camera {idx} is streaming black frames. If this is the iPhone: unlock it, "
+                  "keep it upright with the rear camera uncovered, and make sure no other app is using it.")
 
     def close(self) -> None:
         self.overlay.close()
         self.store.close()
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
 
     # ── controls (safe to call from another thread) ────────────────────────────
 
@@ -736,9 +784,24 @@ class Pipeline:
 
     def step(self) -> Optional[FrameResult]:
         """Process one frame. Returns None if the camera read failed."""
+        if self.cap is None:   # camera missing: keep looking, never fall back to another one
+            if time.time() - self._last_cam_try >= CAMERA_RETRY_S:
+                self._last_cam_try = time.time()
+                try:
+                    self._open_camera()
+                except RuntimeError as e:
+                    self.camera_error = str(e)
+            return None
         ok, frame = self.cap.read()
         if not ok:
+            self._read_fails += 1
+            if self._read_fails >= 30:
+                print("[camera] lost the camera; will reconnect when it's back")
+                self.cap.release()
+                self.cap = None
+                self.camera_error = "Camera disconnected. Reconnecting…"
             return None
+        self._read_fails = 0
 
         auto_zones, trackers = self.auto_zones, self.trackers
         monitor, store, buffer, clip_saver = self.monitor, self.store, self.buffer, self.clip_saver

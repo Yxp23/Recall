@@ -89,7 +89,7 @@ class Runner:
     def _run(self) -> None:
         try:
             pipe = Pipeline(hud=False)   # clean stream: the web UI draws its own status, FPS and dose panel
-            pipe.start()
+            pipe.start(require_camera=False)   # a missing iPhone is retried, not fatal
             pipe.set_talk_to_mom(self.talk_to_mom)
             self.pipe = pipe
             self.error = None
@@ -106,8 +106,8 @@ class Runner:
                     time.sleep(0.1)
                     continue
                 if res is None:
-                    self.error = "camera read failed"
-                    time.sleep(0.5)
+                    self.error = pipe.camera_error or "camera read failed"
+                    time.sleep(0.3)
                     continue
                 self.error = None
                 self.frames["annotated"] = res.annotated

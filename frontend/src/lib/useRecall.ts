@@ -25,10 +25,16 @@ export function useRecall(onEvent?: (e: EventMsg) => void) {
     let timer = 0;
     let closed = false;
 
+    // The server answers 503 until its pipeline has started (models load for a few seconds),
+    // so keep trying to load history until it succeeds, including after the first "ready" snapshot.
+    let historyLoaded = false;
     const loadHistory = () =>
       fetch("/api/events?limit=200")
-        .then((r) => (r.ok ? r.json() : []))
-        .then((list: EventMsg[]) => setEvents((prev) => merge(list, prev)))
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+        .then((list: EventMsg[]) => {
+          historyLoaded = true;
+          setEvents((prev) => merge(list, prev));
+        })
         .catch(() => {});
 
     const connect = () => {
@@ -40,7 +46,10 @@ export function useRecall(onEvent?: (e: EventMsg) => void) {
       };
       ws.onmessage = (m) => {
         const d = JSON.parse(m.data);
-        if (d.type === "state") setSnap(d as Snapshot);
+        if (d.type === "state") {
+          setSnap(d as Snapshot);
+          if (d.ready && !historyLoaded) loadHistory();
+        }
         else if (d.type === "event") {
           setEvents((prev) => merge([d as EventMsg], prev));
           cb.current?.(d as EventMsg);
