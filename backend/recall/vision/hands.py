@@ -73,7 +73,11 @@ _HAND_CONNECTIONS = [
 ]
 
 _VIS_MOUTH = 0.5   # minimum pose visibility to count mouth as visible
-_VIS_JOINT = 0.3   # minimum pose visibility to include a wrist/tip
+_VIS_JOINT = 0.3   # minimum pose visibility to include a shoulder / ear / eye
+_VIS_HAND  = 0.1   # …but hand points near the lips are partly hidden, which is exactly when pose
+                   # visibility drops: keep them at a low bar or the nearest point jumps far away
+_P_EAR_L, _P_EAR_R = 7, 8
+_P_EYE_L, _P_EYE_R = 2, 5
 
 
 @dataclass
@@ -91,6 +95,7 @@ class OverlayResult:
     pose_wrists:       list[tuple[int, int]]        = field(default_factory=list)
     pose_index_tips:   list[tuple[int, int]]        = field(default_factory=list)
     shoulder_width:    Optional[float]              = None    # px distance lm 11–12
+    head_width:        Optional[float]              = None    # px ear-to-ear (or eyes × 2.4): a scale that survives cropped shoulders
     # face-landmarker (for WORN-glasses) with pose head fallback
     face_box:          Optional[tuple[int, int, int, int]] = None
     # full 33-point pose in pixels (for skeleton drawing)
@@ -183,6 +188,7 @@ class HandFaceOverlay:
         pose_wrists:     list[tuple[int, int]] = []
         pose_index_tips: list[tuple[int, int]] = []
         shoulder_width:  Optional[float] = None
+        head_width:      Optional[float] = None
 
         if pose_res.pose_landmarks:
             lms = pose_res.pose_landmarks[0]
@@ -199,14 +205,25 @@ class HandFaceOverlay:
             # wrists
             for idx in (_P_WRIST_L, _P_WRIST_R):
                 lm = lms[idx]
-                if lm.visibility > _VIS_JOINT:
+                if lm.visibility > _VIS_HAND:
                     pose_wrists.append(pose_pts[idx])
 
             # index fingertips
-            for idx in (_P_INDEX_L, _P_INDEX_R):
+            for idx in (_P_INDEX_L, _P_INDEX_R, _P_PINKY_L, _P_PINKY_R, _P_THUMB_L, _P_THUMB_R):
                 lm = lms[idx]
-                if lm.visibility > _VIS_JOINT:
+                if lm.visibility > _VIS_HAND:
                     pose_index_tips.append(pose_pts[idx])
+
+            # head width: a second ruler, in the same pixels as the mouth and the hands
+            head_width = None
+            el, er = lms[_P_EAR_L], lms[_P_EAR_R]
+            ye, yr = lms[_P_EYE_L], lms[_P_EYE_R]
+            if el.visibility > _VIS_JOINT and er.visibility > _VIS_JOINT:
+                head_width = ((pose_pts[_P_EAR_L][0] - pose_pts[_P_EAR_R][0]) ** 2
+                              + (pose_pts[_P_EAR_L][1] - pose_pts[_P_EAR_R][1]) ** 2) ** 0.5
+            elif ye.visibility > _VIS_JOINT and yr.visibility > _VIS_JOINT:
+                head_width = 2.4 * ((pose_pts[_P_EYE_L][0] - pose_pts[_P_EYE_R][0]) ** 2
+                                    + (pose_pts[_P_EYE_L][1] - pose_pts[_P_EYE_R][1]) ** 2) ** 0.5
 
             # shoulder width
             sl, sr = lms[_P_SH_L], lms[_P_SH_R]
@@ -245,6 +262,7 @@ class HandFaceOverlay:
             pose_wrists=pose_wrists,
             pose_index_tips=pose_index_tips,
             shoulder_width=shoulder_width,
+            head_width=head_width,
             face_box=face_box,
             pose_pts=pose_pts,
         )

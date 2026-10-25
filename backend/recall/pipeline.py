@@ -1037,6 +1037,15 @@ class Pipeline:
             wrists_and_tips.append(hnd.palm_center)
             wrists_and_tips += [hnd.landmarks[i] for i in (4, 8, 12)]
 
+        # One ruler for the ratio. The shoulder width can be wrong (shoulders cropped or only guessed by
+        # the pose model); a human's shoulders are about 2.0–3.4 × their ear-to-ear width, so clamp it to
+        # that, and fall back to the head when shoulders are not visible. All of it is in this frame's pixels.
+        scale = mp_result.shoulder_width
+        hw = mp_result.head_width
+        if hw:
+            scale = 2.7 * hw if scale is None else min(max(scale, 2.0 * hw), 3.4 * hw)
+        monitor.frame_size = self.frame_size
+
         dose_events = monitor.update(
             trackers["medication"].state,
             med_events,
@@ -1047,7 +1056,7 @@ class Pipeline:
             wrists_and_tips,
             mp_result.mouth_center,
             mp_result.mouth_visible,
-            mp_result.shoulder_width,
+            scale,
             raw_ts,
             time.time(),
         )

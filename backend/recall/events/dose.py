@@ -133,6 +133,8 @@ class DoseMonitor:
         self._closest_ratio: Optional[float] = None
 
         self.audio_enabled = True   # False = alerts still emit events, but no sound on this Mac
+        self.frame_size: tuple[int, int] = (0, 0)   # set by the pipeline, for the debug line
+        self._dbg: tuple = (None, None, None, 0)    # mouth, nearest hand point, scale, points
 
         self._doses: list[float] = []
         self._unclears: list[float] = []   # unclear pickups held ≥ UNCLEAR_MIN_HELD_S (repeat window)
@@ -270,6 +272,11 @@ class DoseMonitor:
 
         # ── AWAITING_MOUTH: track face + proximity ────────────────────────────
         elif self._state == _AWAITING_MOUTH:
+            m, nh, sc, npts = self._dbg
+            print(f"[dose] frame={self.frame_size[0]}x{self.frame_size[1]} mouth={m} nearest_hand={nh} "
+                  f"shoulder={'%.0f' % sc if sc else 'none'}px ratio="
+                  f"{'%.2f' % self._closest_ratio if self._closest_ratio is not None else 'none'} "
+                  f"(need < {MOUTH_DIST_THRESH:.2f}) points={npts} mouth_visible={mouth_visible}")
             self._hand_ep = None
             self._miss_since = None
             self._w_frames += 1
@@ -508,11 +515,11 @@ class DoseMonitor:
         mouth_center: Optional[tuple[int, int]],
         shoulder_width: Optional[float],
     ) -> Optional[float]:
+        self._dbg = (mouth_center, None, shoulder_width, len(wrists_and_tips))
         if not wrists_and_tips or mouth_center is None or not shoulder_width:
             return None
         mx, my = mouth_center
-        min_dist = min(
-            ((px - mx) ** 2 + (py - my) ** 2) ** 0.5
-            for px, py in wrists_and_tips
-        )
+        nearest = min(wrists_and_tips, key=lambda p: (p[0] - mx) ** 2 + (p[1] - my) ** 2)
+        min_dist = ((nearest[0] - mx) ** 2 + (nearest[1] - my) ** 2) ** 0.5
+        self._dbg = (mouth_center, nearest, shoulder_width, len(wrists_and_tips))
         return min_dist / shoulder_width
